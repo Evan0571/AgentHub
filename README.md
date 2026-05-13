@@ -46,7 +46,7 @@ pnpm dev
 - Server: http://localhost:4000
 - MinIO 控制台: http://localhost:9001（admin / minioadmin）
 
-## 演示模式（不烧 token）
+## 演示模式
 
 设置 `SANDBOX_PROVIDER=mock` 并清空所有真 Adapter 的 API key，Mock Adapter 会从 `packages/adapter-mock/fixtures/` 回放固定的 demo 对话，适合赛事演示兜底。
 
