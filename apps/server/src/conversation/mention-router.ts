@@ -3,6 +3,8 @@ import type { AgentAdapter, AdapterRegistry, ChatRequest } from '@agenthub/adapt
 import type { ClientEvent, ServerEvent } from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import type { OrchestratorService } from '../orchestrator/orchestrator.service.js';
+import { MessagesRepo } from '../db/messages.repo.js';
+import { TracingService } from '../observability/tracing.service.js';
 
 /**
  * @ routing protocol (PRD §5.3):
@@ -30,11 +32,16 @@ const DEFAULT_SYSTEM_PROMPT = `你是 AgentHub 群聊中的助手。请遵守如
    \`\`\`
 
 3. 使用 Markdown：列表用 \`-\`，强调用 \`**bold**\`，命令用行内 \`code\`。
-4. 中文回复（除非用户用英文提问）。简洁、有结论先行。`;
+4. 中文回复（除非用户用英文提问）。简洁、有结论先行。
+5. 多文件 React 项目：**入口文件优先命名为 \`App.tsx\` 或 \`main.tsx\`**；子组件用 PascalCase basename（如 \`TodoItem.tsx\`），路径用 \`src/components/\` 前缀；ESM \`import\` 语法允许，第三方库默认走 esm.sh（react / react-dom / lucide-react / clsx / zustand）。`;
 
 @Injectable()
 export class MentionRouter {
-  constructor(@Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry) {}
+  constructor(
+    @Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry,
+    private readonly messages: MessagesRepo,
+    private readonly tracing: TracingService,
+  ) {}
 
   async route(
     event: Extract<ClientEvent, { op: 'user_msg' }>,
@@ -44,23 +51,78 @@ export class MentionRouter {
     if (event.mentions.length === 0) return;
 
     // If user explicitly invokes Orchestrator (mention "@orchestrator"),
-    // delegate the goal to it instead of a single agent.
+    // delegate the goal to it instead of a single agent. Orchestrator opens
+    // its own trace internally.
     if (event.mentions.includes('orchestrator')) {
       const text = event.content.kind === 'text' ? event.content.text : '';
       await orchestrator.plan({ conversationId: event.conversationId, rootGoal: text }, send);
       return;
     }
 
+    // Wrap the whole multi-@ fan-out in one Langfuse trace so all parallel
+    // agent generations show up grouped under "user_msg".
+    return this.tracing.runWithTrace(
+      {
+        name: 'user_msg',
+        sessionId: event.conversationId,
+        metadata: {
+          conversationId: event.conversationId,
+          mentions: event.mentions,
+        },
+      },
+      () => this.routeImpl(event, send),
+    );
+  }
+
+  private async routeImpl(
+    event: Extract<ClientEvent, { op: 'user_msg' }>,
+    send: (e: ServerEvent) => void,
+  ): Promise<void> {
+
+    // Resolve every mention to its concrete adapter id so each agent knows
+    // *who else* the user is asking in parallel. Without this, agents
+    // receive the same prompt independently and each tries to cover all
+    // requested styles (e.g. "@A @B 各写一个 X" → A writes both styles, B
+    // also writes both styles).
+    const peerAdapterIds = event.mentions.map((m) => this.resolveAdapter(m));
     await Promise.all(
-      event.mentions.map((agentId) =>
+      peerAdapterIds.map((adapterId) =>
         this.invokeAgent({
-          adapterId: this.resolveAdapter(agentId),
+          adapterId,
+          peerAdapterIds,
           conversationId: event.conversationId,
           userText: event.content.kind === 'text' ? event.content.text : '',
           hop: 0,
           send,
         }),
       ),
+    );
+  }
+
+  /**
+   * Build a per-invocation system prompt. When the user @-mentioned multiple
+   * agents in this turn, append a section telling each agent who its peers
+   * are and that it should only produce ITS share — not try to cover all
+   * styles itself.
+   */
+  private buildSystemPrompt(selfId: string, peerAdapterIds: string[]): string {
+    const peers = peerAdapterIds.filter((id) => id !== selfId);
+    if (peers.length === 0) return DEFAULT_SYSTEM_PROMPT;
+
+    const nameOf = (id: string) => (this.registry.has(id) ? this.registry.get(id).displayName : id);
+    const selfName = nameOf(selfId);
+    const peerNames = peers.map(nameOf).join('、');
+
+    return (
+      DEFAULT_SYSTEM_PROMPT +
+      `\n\n## 多 Agent 协作上下文\n\n` +
+      `**用户的同一条消息也同时发给了**：${peerNames}。\n` +
+      `**你的身份**：${selfName}。\n\n` +
+      `重要约束：\n` +
+      `- 你只产出**你自己的那一份**回复，不要替别人写，不要列出他们的版本，不要做横向对比。\n` +
+      `- 用户说"各写一个 X / 各自实现 / 各用自己风格"时，你**只写一个 X**（属于你的那个）。不要列"风格 1 / 风格 2"。\n` +
+      `- 用户说"对比 / diff" 时，你只发表你的看法，让别的 Agent 自己说他们的。\n` +
+      `- 即使其他 Agent 还没回复，也不要替他们设想或代笔。`
     );
   }
 
@@ -75,6 +137,8 @@ export class MentionRouter {
 
   private async invokeAgent(args: {
     adapterId: string;
+    /** All adapters the user @-mentioned in this turn (includes self). */
+    peerAdapterIds: string[];
     conversationId: string;
     userText: string;
     hop: number;
@@ -94,8 +158,9 @@ export class MentionRouter {
     const msgId = cryptoRandomId();
     const req: ChatRequest = {
       taskId: msgId,
-      systemPrompt: DEFAULT_SYSTEM_PROMPT,
+      systemPrompt: this.buildSystemPrompt(args.adapterId, args.peerAdapterIds),
       messages: [{ role: 'user', content: args.userText }],
+      metadata: { purpose: 'chat', agentId: args.adapterId },
     };
 
     args.send({
@@ -109,9 +174,11 @@ export class MentionRouter {
       },
     });
 
+    let assembled = '';
     for await (const ev of adapter.chat(req)) {
       switch (ev.type) {
         case 'token':
+          assembled += ev.text;
           args.send({ op: 'msg_token', msgId, delta: ev.text });
           break;
         case 'thinking':
@@ -140,6 +207,17 @@ export class MentionRouter {
           args.send({ op: 'msg_error', msgId, error: ev.error });
           break;
       }
+    }
+
+    if (assembled.trim()) {
+      void this.messages
+        .insert({
+          conversationSlug: args.conversationId,
+          senderType: 'agent',
+          senderId: args.adapterId,
+          text: assembled,
+        })
+        .catch((e) => console.warn('[mention-router] persist agent msg failed', e));
     }
   }
 }

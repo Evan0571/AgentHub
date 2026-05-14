@@ -5,6 +5,7 @@ import { Send, AtSign } from 'lucide-react';
 import { MessageList } from './MessageList';
 import { useConversationStore } from '@/lib/store';
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
+import { Banner } from '../Banner';
 
 interface MentionState {
   /** Index of the '@' that opened the picker. */
@@ -18,6 +19,7 @@ export function ChatPane() {
     s.conversations.find((c) => c.id === s.activeId),
   );
   const sendUserMessage = useConversationStore((s) => s.sendUserMessage);
+  const hydrate = useConversationStore((s) => s.hydrate);
   const [text, setText] = useState('');
   const [mention, setMention] = useState<MentionState | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -31,6 +33,12 @@ export function ChatPane() {
     setText('');
     setMention(null);
   }, [active?.id]);
+
+  // Fetch persisted history on mount + whenever the active conversation
+  // changes (idempotent; the store dedupes via hydratedConvs).
+  useEffect(() => {
+    if (active?.id) void hydrate(active.id);
+  }, [active?.id, hydrate]);
 
   const candidates: MentionCandidate[] = useMemo(() => {
     if (!active) return [];
@@ -125,6 +133,7 @@ export function ChatPane() {
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-bg">
+      <Banner />
       <header className="flex items-center gap-3 border-b border-white/5 px-5 py-3">
         <div className="flex h-8 w-8 items-center justify-center rounded bg-accent/20 text-accent font-semibold">
           {active.title[0]}

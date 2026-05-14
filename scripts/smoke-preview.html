@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.4/babel.min.js"></script>
+<style>body{font-family:system-ui;padding:16px;}</style></head>
+<body><div id="root"></div><div id="__err"></div>
+<script type="text/babel" data-presets="env,react,typescript">
+const { useState, useEffect, useRef, useMemo, useCallback, useReducer, useContext, Fragment } = React;
+let __default__;
+try {
+/* import stripped */
+type CounterProps = {
+  initialValue?: number;
+};
+
+const Counter: React.FC<CounterProps> = ({ initialValue = 0 }) => {
+  const [count, setCount] = useState(initialValue);
+
+  return (
+    <div className="flex items-center gap-4 p-4 bg-gray-100 rounded-lg shadow-sm">
+      <button
+        className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+        onClick={() => setCount((prev) => prev - 1)}
+      >
+        −
+      </button>
+
+      <span className="text-2xl font-bold min-w-[3rem] text-center">
+        {count}
+      </span>
+
+      <button
+        className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 transition-colors"
+        onClick={() => setCount((prev) => prev + 1)}
+      >
+        +
+      </button>
+
+      <button
+        className="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors"
+        onClick={() => setCount(initialValue)}
+      >
+        重置
+      </button>
+    </div>
+  );
+};
+const __default__ = Counter;
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(Counter));
+} catch (e) { document.getElementById('__err').innerHTML = '<pre style="color:red">' + (e.stack || e) + '</pre>'; }
+</script></body></html>

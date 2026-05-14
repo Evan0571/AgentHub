@@ -46,7 +46,28 @@ pnpm dev
 - Server: http://localhost:4000
 - MinIO 控制台: http://localhost:9001（admin / minioadmin）
 
-## 演示模式
+## 可观测性（Langfuse）
+
+每次 LLM 调用都会自动作为 `generation` 上报到 Langfuse，同一次 `user_msg` /
+`orchestrator.plan` / `suggest_deps` 下的所有调用聚合成一个 trace，便于在
+dashboard 里看 cost / latency / token / 调用图谱。
+
+启用方式：
+1. 去 https://cloud.langfuse.com 注册（free tier 50k events / 月够用），
+   或自行用 docker 跑 `langfuse/langfuse:latest`
+2. 拿到 `Public Key` + `Secret Key`，填到 `.env`：
+   ```
+   LANGFUSE_PUBLIC_KEY=pk-lf-xxx
+   LANGFUSE_SECRET_KEY=sk-lf-xxx
+   LANGFUSE_HOST=https://cloud.langfuse.com  # 自托管改成你的地址
+   ```
+3. 重启 server，启动日志会打印 `Langfuse enabled @ ...`
+4. 在 AgentHub 触发任意操作（聊一句话或 `@orchestrator …`）
+5. 打开 Langfuse → Traces，按 `sessionId`（= 会话 slug）筛选
+
+未配置 key 时整个 tracing 子系统会 no-op（不会失败、不会拖慢），适合默认状态。
+
+## 演示模式（不烧 token）
 
 设置 `SANDBOX_PROVIDER=mock` 并清空所有真 Adapter 的 API key，Mock Adapter 会从 `packages/adapter-mock/fixtures/` 回放固定的 demo 对话，适合赛事演示兜底。
 

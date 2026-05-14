@@ -7,6 +7,7 @@ import { PlanService } from './plan.service.js';
 
 @Module({
   providers: [OrchestratorService, PlannerService, ExecutorService, CriticService, PlanService],
-  exports: [OrchestratorService],
+  // PlanService is consumed by ConversationController for /api/conversations/:id/state hydration.
+  exports: [OrchestratorService, PlanService],
 })
 export class OrchestratorModule {}

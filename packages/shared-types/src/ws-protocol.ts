@@ -1,4 +1,4 @@
-import type { ID, Message, MessageContent } from './domain.js';
+import type { ID, ISODateTime, Message, MessageContent } from './domain.js';
 import type { Plan, PlanEdit } from './plan.js';
 
 /** Client → Server */
@@ -10,6 +10,8 @@ export type ClientEvent =
   | { op: 'edit_plan'; planId: ID; edits: PlanEdit[]; baseVersion: number }
   | { op: 'pause_plan'; planId: ID }
   | { op: 'resume_plan'; planId: ID }
+  | { op: 'suggest_deps'; planId: ID; requestId: string; newGoal: string }
+  | { op: 'deploy'; conversationId: ID; target: 'vercel' | 'mock'; html: string; projectName?: string }
   | { op: 'replay_request'; conversationId: ID; sinceMessageId?: ID; speed?: number };
 
 /** Server → Client */
@@ -23,9 +25,20 @@ export type ServerEvent =
   | { op: 'patch'; msgId: ID; snapshotId: ID; files: FileDiffSummary[] }
   | { op: 'plan_update'; plan: Plan }
   | { op: 'plan_conflict'; planId: ID; serverVersion: number; clientVersion: number }
+  | { op: 'dep_suggestion'; planId: ID; requestId: string; suggestedInputs: ID[]; reasoning?: string }
+  | { op: 'dep_suggestion_error'; planId: ID; requestId: string; message: string }
   | { op: 'preview_ready'; sandboxId: ID; url: string; shareUrl?: string }
   | { op: 'preview_log'; sandboxId: ID; stream: 'stdout' | 'stderr'; line: string }
-  | { op: 'deploy_status'; deploymentId: ID; status: 'queued' | 'building' | 'ready' | 'failed' | 'rolled-back'; url?: string }
+  | {
+      op: 'deploy_status';
+      deploymentId: ID;
+      conversationId: ID;
+      target: 'vercel' | 'mock';
+      status: 'queued' | 'building' | 'ready' | 'failed' | 'rolled-back';
+      url?: string;
+      errorMessage?: string;
+      createdAt: ISODateTime;
+    }
   | { op: 'replay_frame'; frame: ReplayFrame }
   | { op: 'error'; code: string; message: string; retryable: boolean };
 

@@ -13,8 +13,7 @@
     "clean": "rimraf dist .turbo"
   },
   "dependencies": {
-    "@agenthub/adapter-core": "workspace:*",
-    "openai": "^4.77.0"
+    "@agenthub/adapter-core": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

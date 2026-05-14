@@ -104,7 +104,9 @@ export const messages = pgTable(
       .notNull()
       .references(() => conversations.id, { onDelete: 'cascade' }),
     senderType: senderType('sender_type').notNull(),
-    senderId: uuid('sender_id').notNull(),                    // user or agent id (loose ref)
+    // text not uuid: senders can be a user UUID, an agent string id
+    // (e.g. 'deepseek-v3'), or 'orchestrator' / 'system'.
+    senderId: text('sender_id').notNull(),
     contentType: text('content_type').notNull(),
     body: jsonb('body').notNull(),
     mentions: jsonb('mentions').notNull().default([]),

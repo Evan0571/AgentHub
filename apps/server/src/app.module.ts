@@ -6,6 +6,9 @@ import { OrchestratorModule } from './orchestrator/orchestrator.module.js';
 import { WorkspaceModule } from './workspace/workspace.module.js';
 import { SandboxModule } from './sandbox/sandbox.module.js';
 import { DeployModule } from './deploy/deploy.module.js';
+import { DbModule } from './db/db.module.js';
+import { SeedService } from './db/seed.service.js';
+import { TracingModule } from './observability/tracing.service.js';
 import { HealthController } from './health.controller.js';
 
 @Module({
@@ -14,6 +17,8 @@ import { HealthController } from './health.controller.js';
       isGlobal: true,
       envFilePath: ['../../.env', '.env'],
     }),
+    TracingModule,
+    DbModule,
     AdapterModule,
     ConversationModule,
     OrchestratorModule,
@@ -22,5 +27,6 @@ import { HealthController } from './health.controller.js';
     DeployModule,
   ],
   controllers: [HealthController],
+  providers: [SeedService],
 })
 export class AppModule {}

@@ -1,17 +1,27 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import clsx from 'clsx';
 import {
+  AlertCircle,
+  ArrowDown,
+  Check,
   CheckCircle2,
   Circle,
   CircleDashed,
+  Info,
   Loader2,
+  Pencil,
+  Plus,
+  Sparkles,
+  Trash2,
+  X,
   XCircle,
-  AlertCircle,
-  ArrowDown,
 } from 'lucide-react';
-import type { Plan, PlanTask, TaskStatus } from '@agenthub/shared-types';
+import type { Plan, PlanEdit, PlanTask, TaskStatus } from '@agenthub/shared-types';
+import { useConversationStore } from '@/lib/store';
+
+const AGENTS = ['deepseek-v3', 'deepseek-r1', 'codex', 'claude-code', 'doubao', 'mock'] as const;
 
 const AGENT_NAME: Record<string, string> = {
   'deepseek-v3': 'V3',
@@ -33,6 +43,11 @@ const AGENT_COLOR: Record<string, string> = {
 export function PlanCard({ plan }: { plan: Plan }) {
   const grouped = useMemo(() => groupByDepth(plan), [plan]);
   const stats = useMemo(() => statsFor(plan), [plan]);
+  const [editMode, setEditMode] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const editPlan = useConversationStore((s) => s.editPlan);
+  const editable = plan.status !== 'executing'; // editing live plans is risky; lock during exec
 
   return (
     <div className="space-y-3">
@@ -40,6 +55,26 @@ export function PlanCard({ plan }: { plan: Plan }) {
         <div className="flex items-baseline gap-2">
           <span className="text-[10px] uppercase tracking-wider text-text-muted">Root goal</span>
           <PlanStatusBadge status={plan.status} />
+          <button
+            onClick={() => {
+              setEditMode((m) => !m);
+              setEditingId(null);
+              setAdding(false);
+            }}
+            disabled={!editable}
+            className={clsx(
+              'ml-auto rounded px-2 py-0.5 text-[10px]',
+              editMode
+                ? 'bg-accent/20 text-accent'
+                : editable
+                  ? 'bg-white/5 text-text-muted hover:bg-white/10 hover:text-text'
+                  : 'bg-white/5 text-text-muted/40 cursor-not-allowed',
+            )}
+            title={editable ? '切换编辑模式' : '执行中无法编辑 plan'}
+          >
+            <Pencil className="mr-1 inline h-3 w-3" />
+            {editMode ? '完成编辑' : '编辑'}
+          </button>
         </div>
         <div className="mt-1 text-sm text-text">{plan.rootGoal}</div>
         <div className="mt-2 flex items-center gap-3 text-[11px] text-text-muted">
@@ -59,9 +94,32 @@ export function PlanCard({ plan }: { plan: Plan }) {
 
       {grouped.map((layer, layerIdx) => (
         <div key={layerIdx} className="space-y-2">
-          {layer.map((task) => (
-            <TaskRow key={task.id} task={task} />
-          ))}
+          {layer.map((task) =>
+            editingId === task.id ? (
+              <TaskEditor
+                key={task.id}
+                plan={plan}
+                task={task}
+                onCancel={() => setEditingId(null)}
+                onSave={(edits) => {
+                  editPlan(plan.id, edits);
+                  setEditingId(null);
+                }}
+              />
+            ) : (
+              <TaskRow
+                key={task.id}
+                task={task}
+                editMode={editMode}
+                onEdit={() => setEditingId(task.id)}
+                onDelete={() => {
+                  if (!confirm(`确认删除 ${task.id} (${task.goal.slice(0, 30)}…)？所有下游任务将失去对它的依赖。`))
+                    return;
+                  editPlan(plan.id, [{ op: 'remove-task', taskId: task.id }]);
+                }}
+              />
+            ),
+          )}
           {layerIdx < grouped.length - 1 ? (
             <div className="flex justify-center text-text-muted/40">
               <ArrowDown className="h-3 w-3" />
@@ -69,18 +127,49 @@ export function PlanCard({ plan }: { plan: Plan }) {
           ) : null}
         </div>
       ))}
+
+      {editMode ? (
+        adding ? (
+          <NewTaskForm
+            plan={plan}
+            onCancel={() => setAdding(false)}
+            onCreate={(edits) => {
+              editPlan(plan.id, edits);
+              setAdding(false);
+            }}
+          />
+        ) : (
+          <button
+            onClick={() => setAdding(true)}
+            className="flex w-full items-center justify-center gap-1 rounded-md border border-dashed border-white/10 py-2 text-xs text-text-muted hover:border-accent/40 hover:bg-white/5 hover:text-text"
+          >
+            <Plus className="h-3 w-3" />
+            添加任务
+          </button>
+        )
+      ) : null}
     </div>
   );
 }
 
-function TaskRow({ task }: { task: PlanTask }) {
+function TaskRow({
+  task,
+  editMode,
+  onEdit,
+  onDelete,
+}: {
+  task: PlanTask;
+  editMode: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
   const agentName = task.assigneeAgentId ? AGENT_NAME[task.assigneeAgentId] ?? task.assigneeAgentId : '?';
   const agentColor = task.assigneeAgentId ? AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280' : '#6b7280';
 
   return (
     <div
       className={clsx(
-        'rounded-lg border p-2.5 text-xs transition',
+        'group rounded-lg border p-2.5 text-xs transition',
         task.status === 'running'
           ? 'border-accent/40 bg-accent/5'
           : task.status === 'succeeded'
@@ -123,6 +212,292 @@ function TaskRow({ task }: { task: PlanTask }) {
             </div>
           ) : null}
         </div>
+        {editMode ? (
+          <div className="flex shrink-0 items-center gap-0.5 opacity-70 group-hover:opacity-100">
+            <button
+              onClick={onEdit}
+              className="rounded p-1 text-text-muted hover:bg-white/10 hover:text-text"
+              title="编辑"
+            >
+              <Pencil className="h-3 w-3" />
+            </button>
+            <button
+              onClick={onDelete}
+              className="rounded p-1 text-rose-400/70 hover:bg-rose-500/10 hover:text-rose-300"
+              title="删除"
+            >
+              <Trash2 className="h-3 w-3" />
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function TaskEditor({
+  plan,
+  task,
+  onCancel,
+  onSave,
+}: {
+  plan: Plan;
+  task: PlanTask;
+  onCancel: () => void;
+  onSave: (edits: PlanEdit[]) => void;
+}) {
+  const [goal, setGoal] = useState(task.goal);
+  const [assignee, setAssignee] = useState(task.assigneeAgentId ?? '');
+  const [inputs, setInputs] = useState<string[]>(task.inputs);
+
+  const otherTasks = plan.tasks.filter((t) => t.id !== task.id);
+  const wouldCycle = (newInputs: string[]) => detectCycleWithEdit(plan, task.id, newInputs);
+
+  const onSubmit = () => {
+    const patch: Partial<PlanTask> = {};
+    if (goal !== task.goal) patch.goal = goal.trim() || task.goal;
+    if (assignee !== (task.assigneeAgentId ?? '')) patch.assigneeAgentId = assignee || undefined;
+    if (!arraysEqual(inputs, task.inputs)) patch.inputs = inputs;
+    if (Object.keys(patch).length === 0) {
+      onCancel();
+      return;
+    }
+    onSave([{ op: 'update-task', taskId: task.id, patch }]);
+  };
+
+  return (
+    <div className="rounded-lg border border-accent/40 bg-accent/5 p-3 text-xs space-y-2">
+      <div className="flex items-baseline gap-2">
+        <span className="font-mono text-[10px] text-text-muted">{task.id}</span>
+        <span className="text-[10px] uppercase tracking-wider text-accent">编辑中</span>
+      </div>
+      <label className="block">
+        <span className="text-[10px] text-text-muted">目标</span>
+        <textarea
+          value={goal}
+          onChange={(e) => setGoal(e.target.value)}
+          rows={2}
+          className="mt-0.5 w-full resize-none rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-accent"
+        />
+      </label>
+      <label className="block">
+        <span className="text-[10px] text-text-muted">Agent</span>
+        <select
+          value={assignee}
+          onChange={(e) => setAssignee(e.target.value)}
+          className="mt-0.5 w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-accent"
+        >
+          <option value="">（未指定）</option>
+          {AGENTS.map((a) => (
+            <option key={a} value={a}>
+              {AGENT_NAME[a]} ({a})
+            </option>
+          ))}
+        </select>
+      </label>
+      <div>
+        <span className="text-[10px] text-text-muted">依赖（inputs）</span>
+        <div className="mt-0.5 flex items-start gap-1 rounded bg-white/[0.03] px-2 py-1 text-[10px] text-text-muted">
+          <Info className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>勾选会形成环依赖的选项已置灰。改 inputs 不会重跑已成功的下游。</span>
+        </div>
+        <div className="mt-0.5 max-h-32 space-y-0.5 overflow-y-auto rounded border border-white/5 bg-bg/60 p-1">
+          {otherTasks.length === 0 ? (
+            <div className="px-2 py-1 text-[11px] text-text-muted/70">没有其他任务</div>
+          ) : (
+            otherTasks.map((t) => {
+              const checked = inputs.includes(t.id);
+              const next = checked ? inputs.filter((i) => i !== t.id) : [...inputs, t.id];
+              const cycle = !checked && wouldCycle(next);
+              return (
+                <label
+                  key={t.id}
+                  className={clsx(
+                    'flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-[11px]',
+                    cycle ? 'opacity-40' : 'hover:bg-white/5',
+                  )}
+                  title={cycle ? '勾选会形成环依赖' : undefined}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={cycle}
+                    onChange={() => setInputs(next)}
+                  />
+                  <span className="font-mono text-text-muted">{t.id}</span>
+                  <span className="truncate">{t.goal}</span>
+                </label>
+              );
+            })
+          )}
+        </div>
+      </div>
+      <div className="flex justify-end gap-1 pt-1">
+        <button
+          onClick={onCancel}
+          className="rounded px-2 py-1 text-[11px] text-text-muted hover:bg-white/5 hover:text-text"
+        >
+          <X className="mr-1 inline h-3 w-3" />
+          取消
+        </button>
+        <button
+          onClick={onSubmit}
+          className="rounded bg-accent px-2 py-1 text-[11px] text-white hover:bg-accent-hover"
+        >
+          <Check className="mr-1 inline h-3 w-3" />
+          保存
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NewTaskForm({
+  plan,
+  onCancel,
+  onCreate,
+}: {
+  plan: Plan;
+  onCancel: () => void;
+  onCreate: (edits: PlanEdit[]) => void;
+}) {
+  const [goal, setGoal] = useState('');
+  const [assignee, setAssignee] = useState('deepseek-v3');
+  const [inputs, setInputs] = useState<string[]>([]);
+  const [suggesting, setSuggesting] = useState(false);
+  const [suggestion, setSuggestion] = useState<{ reasoning?: string } | null>(null);
+  const suggestDeps = useConversationStore((s) => s.suggestDeps);
+
+  const id = useMemo(() => {
+    let i = plan.tasks.length + 1;
+    while (plan.tasks.some((t) => t.id === `T${i}`)) i++;
+    return `T${i}`;
+  }, [plan.tasks]);
+
+  const onSubmit = () => {
+    if (!goal.trim()) return;
+    onCreate([
+      {
+        op: 'add-task',
+        task: {
+          id,
+          goal: goal.trim(),
+          assigneeAgentId: assignee || undefined,
+          inputs,
+          acceptance: [{ kind: 'manual' }],
+        },
+      },
+    ]);
+  };
+
+  const onSuggest = async () => {
+    if (!goal.trim() || suggesting) return;
+    setSuggesting(true);
+    setSuggestion(null);
+    try {
+      const r = await suggestDeps(plan.id, goal.trim());
+      setInputs(r.inputs);
+      setSuggestion({ reasoning: r.reasoning });
+    } catch (e) {
+      setSuggestion({ reasoning: '（推荐失败：' + (e instanceof Error ? e.message : 'unknown') + '）' });
+    } finally {
+      setSuggesting(false);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-xs space-y-2">
+      <div className="text-[10px] uppercase tracking-wider text-emerald-300">
+        + 新任务 · {id}
+      </div>
+      <input
+        autoFocus
+        placeholder="目标（简短一句，如：实现深色模式切换）"
+        value={goal}
+        onChange={(e) => setGoal(e.target.value)}
+        className="w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-emerald-400"
+      />
+      <select
+        value={assignee}
+        onChange={(e) => setAssignee(e.target.value)}
+        className="w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-emerald-400"
+      >
+        {AGENTS.map((a) => (
+          <option key={a} value={a}>
+            {AGENT_NAME[a]} ({a})
+          </option>
+        ))}
+      </select>
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] text-text-muted">前置依赖（inputs）</span>
+          <button
+            type="button"
+            onClick={onSuggest}
+            disabled={!goal.trim() || suggesting || plan.tasks.length === 0}
+            className="flex items-center gap-1 rounded bg-accent/20 px-2 py-0.5 text-[10px] text-accent hover:bg-accent/30 disabled:opacity-40"
+            title="让 AI 根据目标和已有任务推荐依赖"
+          >
+            {suggesting ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Sparkles className="h-3 w-3" />
+            )}
+            {suggesting ? '推荐中…' : '智能推荐'}
+          </button>
+        </div>
+        <div className="flex items-start gap-1 rounded bg-white/[0.03] px-2 py-1 text-[10px] text-text-muted">
+          <Info className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            勾选 = 等该任务完成后再启动本任务。**不勾 = 立即并发执行**（适合入口/初始化）。
+            不确定就点「智能推荐」让 AI 帮你判断。
+          </span>
+        </div>
+        {suggestion?.reasoning ? (
+          <div className="rounded border border-accent/20 bg-accent/5 px-2 py-1 text-[10px] text-accent">
+            💡 {suggestion.reasoning}
+          </div>
+        ) : null}
+      </div>
+      <div className="max-h-28 space-y-0.5 overflow-y-auto rounded border border-white/5 bg-bg/60 p-1">
+        {plan.tasks.length === 0 ? (
+          <div className="px-2 py-1 text-[11px] text-text-muted/70">还没有其他任务</div>
+        ) : (
+          plan.tasks.map((t) => {
+            const checked = inputs.includes(t.id);
+            return (
+              <label
+                key={t.id}
+                className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-[11px] hover:bg-white/5"
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() =>
+                    setInputs(checked ? inputs.filter((i) => i !== t.id) : [...inputs, t.id])
+                  }
+                />
+                <span className="font-mono text-text-muted">{t.id}</span>
+                <span className="truncate">{t.goal}</span>
+              </label>
+            );
+          })
+        )}
+      </div>
+      <div className="flex justify-end gap-1 pt-1">
+        <button
+          onClick={onCancel}
+          className="rounded px-2 py-1 text-[11px] text-text-muted hover:bg-white/5 hover:text-text"
+        >
+          取消
+        </button>
+        <button
+          onClick={onSubmit}
+          disabled={!goal.trim()}
+          className="rounded bg-emerald-500 px-2 py-1 text-[11px] text-white hover:bg-emerald-600 disabled:opacity-40"
+        >
+          创建
+        </button>
       </div>
     </div>
   );
@@ -191,16 +566,12 @@ function statsFor(plan: Plan): Stats {
   return { total: plan.tasks.length, succeeded, running, failed, done };
 }
 
-/**
- * Group tasks by DAG depth so we can render layered, top-down with arrows.
- * depth(T) = 0 if T.inputs is empty, else 1 + max(depth(input)).
- */
 function groupByDepth(plan: Plan): PlanTask[][] {
   const byId = new Map(plan.tasks.map((t) => [t.id, t] as const));
   const depthCache = new Map<string, number>();
   const depthOf = (id: string, visiting = new Set<string>()): number => {
     if (depthCache.has(id)) return depthCache.get(id)!;
-    if (visiting.has(id)) return 0; // cycle guard
+    if (visiting.has(id)) return 0;
     visiting.add(id);
     const t = byId.get(id);
     if (!t || t.inputs.length === 0) {
@@ -218,4 +589,31 @@ function groupByDepth(plan: Plan): PlanTask[][] {
     (layers[d] ??= []).push(t);
   }
   return layers.filter(Boolean);
+}
+
+/** Detect if applying `newInputs` for `taskId` would create a cycle in the plan. */
+function detectCycleWithEdit(plan: Plan, taskId: string, newInputs: string[]): boolean {
+  const adj = new Map<string, string[]>();
+  for (const t of plan.tasks) {
+    adj.set(t.id, t.id === taskId ? newInputs : t.inputs);
+  }
+  const color = new Map<string, 0 | 1 | 2>();
+  const dfs = (u: string): boolean => {
+    color.set(u, 1);
+    for (const v of adj.get(u) ?? []) {
+      const c = color.get(v) ?? 0;
+      if (c === 1) return true;
+      if (c === 0 && dfs(v)) return true;
+    }
+    color.set(u, 2);
+    return false;
+  };
+  for (const t of plan.tasks) if ((color.get(t.id) ?? 0) === 0 && dfs(t.id)) return true;
+  return false;
+}
+
+function arraysEqual<T>(a: T[], b: T[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

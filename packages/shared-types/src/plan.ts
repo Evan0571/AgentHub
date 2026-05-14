@@ -21,6 +21,17 @@ export interface PlanTask {
   finishedAt?: ISODateTime;
   artifactRefs?: { snapshotId?: ID; messageId?: ID };
   error?: { code: string; message: string };
+  /**
+   * Captured agent reply text. Used to feed downstream tasks the real code
+   * their predecessors produced — without it, agents writing the entry file
+   * have no idea what exports the components above produced.
+   */
+  outputText?: string;
+  /**
+   * Most recent Critic feedback when retrying. Prepended to the next attempt's
+   * user message so the agent can self-correct rather than reproduce the bug.
+   */
+  criticFeedback?: string;
 }
 
 export type AcceptanceRule =

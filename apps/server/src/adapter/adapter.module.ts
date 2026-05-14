@@ -10,6 +10,8 @@ import { ClaudeCodeAdapter } from '@agenthub/adapter-claude-code';
 import { CodexAdapter } from '@agenthub/adapter-codex';
 import { DeepSeekAdapter } from '@agenthub/adapter-deepseek';
 import { DoubaoAdapter } from '@agenthub/adapter-doubao';
+import { TracingService } from '../observability/tracing.service.js';
+import { withLangfuse } from '../observability/adapter-tracing.js';
 
 const ADAPTER_REGISTRY = 'ADAPTER_REGISTRY';
 
@@ -18,9 +20,12 @@ const ADAPTER_REGISTRY = 'ADAPTER_REGISTRY';
   providers: [
     {
       provide: ADAPTER_REGISTRY,
-      useFactory: () => {
+      inject: [TracingService],
+      useFactory: (tracing: TracingService) => {
         const registry = new AdapterRegistry();
-        const wrap = compose(withLogging, withRetry({ max: 2 }));
+        // Order matters: langfuse OUTSIDE retry so retried calls each show as
+        // separate generations; logging OUTSIDE everything for full visibility.
+        const wrap = compose(withLogging, withLangfuse(tracing), withRetry({ max: 2 }));
 
         // Mock is always available (zero-config demo fallback).
         registry.register(wrap(new MockAdapter()));

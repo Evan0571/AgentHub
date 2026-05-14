@@ -1,7 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { Check, Copy, FileCode2 } from 'lucide-react';
+import { Check, Copy, FileCode2, Play } from 'lucide-react';
+import { useConversationStore } from '@/lib/store';
+import { isRunnable } from '@/lib/preview-utils';
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx';
@@ -51,15 +53,23 @@ export interface CodeCardProps {
   lang?: string;
   /** Optional file path extracted from the meta string (` ```ts path=src/a.ts `). */
   filePath?: string;
+  /** Stable uid (`${msgId}#${blockIdx}`) for opening in Preview tab. */
+  blockUid?: string;
 }
 
-export function CodeCard({ code, lang, filePath }: CodeCardProps) {
+export function CodeCard({ code, lang, filePath, blockUid }: CodeCardProps) {
   const isDiff = (lang ?? '').toLowerCase() === 'diff' || looksLikeUnifiedDiff(code);
   const displayLang = (lang || 'text').toLowerCase();
 
   return (
     <div className="my-2 max-w-full overflow-hidden rounded-lg border border-white/10 bg-bg-soft/60">
-      <CardHeader code={code} lang={displayLang} filePath={filePath} isDiff={isDiff} />
+      <CardHeader
+        code={code}
+        lang={displayLang}
+        filePath={filePath}
+        isDiff={isDiff}
+        blockUid={blockUid}
+      />
       {isDiff ? <DiffBody code={code} /> : <CodeBody code={code} lang={displayLang} />}
     </div>
   );
@@ -70,12 +80,24 @@ function CardHeader({
   lang,
   filePath,
   isDiff,
+  blockUid,
 }: {
   code: string;
   lang: string;
   filePath?: string;
   isDiff: boolean;
+  blockUid?: string;
 }) {
+  const openPreview = useConversationStore((s) => s.openPreview);
+  const runnable =
+    !!blockUid && isRunnable({ uid: blockUid, fromMessageId: '', lang, path: filePath, code });
+  // Only files that look like top-level entries become the preview entry on
+  // click. For child components we just open the Preview tab and let the user
+  // see the existing entry (avoids "props undefined" crashes).
+  const isEntryLike = (() => {
+    const base = filePath?.split(/[\\/]/).pop()?.replace(/\.(tsx?|jsx?|vue)$/i, '') ?? '';
+    return ['App', 'Main', 'Index', 'Page', 'Root', 'main', 'index'].includes(base);
+  })();
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
     try {
@@ -99,9 +121,22 @@ function CardHeader({
           {isDiff ? 'diff' : lang}
         </span>
       ) : null}
+      {runnable && blockUid ? (
+        <button
+          onClick={() => openPreview(blockUid, { setEntry: isEntryLike })}
+          className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-emerald-300 hover:bg-emerald-500/10"
+          title={isEntryLike ? '在右侧 Preview 中以本文件为入口运行' : '在右侧 Preview 中查看（入口仍为 App 类文件，点文件列表可显式切换入口）'}
+        >
+          <Play className="h-3 w-3 fill-current" />
+          <span>运行</span>
+        </button>
+      ) : null}
       <button
         onClick={onCopy}
-        className="ml-auto flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-white/5 hover:text-text"
+        className={
+          (runnable ? '' : 'ml-auto ') +
+          'flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:bg-white/5 hover:text-text'
+        }
         aria-label="copy"
       >
         {copied ? (

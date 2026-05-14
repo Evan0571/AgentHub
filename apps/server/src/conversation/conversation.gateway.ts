@@ -12,6 +12,7 @@ import { ConversationService } from './conversation.service.js';
 import { MentionRouter } from './mention-router.js';
 import { OrchestratorService } from '../orchestrator/orchestrator.service.js';
 import { ReplayService } from './replay.service.js';
+import { DeployService } from '../deploy/deploy.service.js';
 
 /**
  * Single WS endpoint that multiplexes all chat events.
@@ -26,17 +27,20 @@ export class ConversationGateway {
   private readonly mention: MentionRouter;
   private readonly orchestrator: OrchestratorService;
   private readonly replay: ReplayService;
+  private readonly deploy: DeployService;
 
   constructor(
     conv: ConversationService,
     mention: MentionRouter,
     orchestrator: OrchestratorService,
     replay: ReplayService,
+    deploy: DeployService,
   ) {
     this.conv = conv;
     this.mention = mention;
     this.orchestrator = orchestrator;
     this.replay = replay;
+    this.deploy = deploy;
   }
 
   @SubscribeMessage('client_event')
@@ -66,6 +70,12 @@ export class ConversationGateway {
         return;
       case 'resume_plan':
         await this.orchestrator.resume(event.planId);
+        return;
+      case 'suggest_deps':
+        await this.orchestrator.suggestDeps(event, send);
+        return;
+      case 'deploy':
+        await this.deploy.deploy(event, send);
         return;
       case 'replay_request':
         await this.replay.stream(event, send);

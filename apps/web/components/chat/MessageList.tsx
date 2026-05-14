@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Sparkles } from 'lucide-react';
 import { useConversationStore, type ChatMessage, EMPTY_MESSAGES } from '@/lib/store';
 import { Markdown } from './Markdown';
@@ -12,9 +12,12 @@ export function MessageList({ conversationId }: { conversationId: string }) {
   );
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Only depend on length + the currently-streaming message's length —
+  // not on the whole `messages` array (would scroll on any state change).
+  const lastLen = messages[messages.length - 1]?.text.length ?? 0;
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length, messages[messages.length - 1]?.text.length]);
+  }, [messages.length, lastLen]);
 
   return (
     <div className="flex-1 space-y-5 overflow-y-auto px-5 py-4">
@@ -26,7 +29,12 @@ export function MessageList({ conversationId }: { conversationId: string }) {
   );
 }
 
-function MessageRow({ m }: { m: ChatMessage }) {
+// `memo` on the row means only messages whose reference actually changed
+// re-render. Since `patchMsg` in the store uses `.map((m) => m.id === id ? ...
+// : m)`, untouched messages keep their object identity → memo short-circuits.
+const MessageRow = memo(MessageRowImpl, (prev, next) => prev.m === next.m);
+
+function MessageRowImpl({ m }: { m: ChatMessage }) {
   const isUser = m.senderType === 'user';
   const isSystem = m.senderType === 'system';
 
@@ -54,7 +62,7 @@ function MessageRow({ m }: { m: ChatMessage }) {
           isUser || isSystem ? (
             <MentionText text={m.text} conversationId={m.conversationId} />
           ) : (
-            <Markdown text={m.text} />
+            <Markdown text={m.text} messageId={m.id} />
           )
         ) : m.streaming && !m.thinking ? (
           <StreamingDots />

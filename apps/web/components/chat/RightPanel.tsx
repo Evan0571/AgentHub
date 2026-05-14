@@ -4,6 +4,8 @@ import { Folder, GitBranch, Monitor, Rocket } from 'lucide-react';
 import clsx from 'clsx';
 import { useConversationStore } from '@/lib/store';
 import { PlanCard } from './PlanCard';
+import { PreviewPanel } from './PreviewPanel';
+import { DeployPanel } from './DeployPanel';
 
 export function RightPanel() {
   const tab = useConversationStore((s) => s.rightPanelTab);
@@ -35,7 +37,7 @@ export function RightPanel() {
         </TabBtn>
       </nav>
 
-      <div className="flex-1 overflow-y-auto p-4 text-sm">
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4 text-sm">
         {tab === 'workspace' && (
           <div className="text-text-muted">
             文件树 / Diff 视图（v1 占位 — 后续接入 Workspace 快照存储）
@@ -49,14 +51,8 @@ export function RightPanel() {
               当前会话还没有 Plan。在群聊里发送 <code className="rounded bg-white/10 px-1">@orchestrator 你的目标</code> 即可触发任务拆解。
             </div>
           ))}
-        {tab === 'preview' && (
-          <div className="text-text-muted">
-            沙箱 iframe + 日志面板（v1 占位 — 待接入 E2B / WebContainer）
-          </div>
-        )}
-        {tab === 'deploy' && (
-          <div className="text-text-muted">部署状态卡片（v1 占位）</div>
-        )}
+        {tab === 'preview' && <PreviewPanel />}
+        {tab === 'deploy' && <DeployPanel />}
       </div>
 
       <footer className="border-t border-white/5 px-3 py-2 text-[10px] text-text-muted/70">

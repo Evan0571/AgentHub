@@ -1,5 +1,6 @@
 'use client';
 
+import { useMemo, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { CodeCard } from './CodeCard';
@@ -8,8 +9,17 @@ import { CodeCard } from './CodeCard';
  * Chat-tuned Markdown renderer.
  * Streaming-safe: incomplete markdown (un-closed ``` etc) renders as best-effort
  * without crashing.
+ *
+ * `messageId` enables the CodeCard's "Run in Preview" affordance by computing
+ * a stable block uid that matches `extractCodeBlocks()` output.
  */
-export function Markdown({ text }: { text: string }) {
+export function Markdown({ text, messageId }: { text: string; messageId?: string }) {
+  const counterRef = useRef(0);
+  // Reset the per-render counter when content changes so block #0 always
+  // refers to the first fenced block in source order.
+  useMemo(() => {
+    counterRef.current = 0;
+  }, [text]);
   return (
     <div className="agenthub-md text-sm leading-relaxed">
       <ReactMarkdown
@@ -47,11 +57,20 @@ export function Markdown({ text }: { text: string }) {
             const lang = langMatch[1];
             const meta = node?.data?.meta ?? '';
             const pathMatch = /(?:^|\s)path=([^\s]+)/.exec(meta);
-            const text = Array.isArray(children)
+            const codeText = Array.isArray(children)
               ? children.join('')
               : String(children ?? '');
+            const blockIdx = counterRef.current++;
+            const blockUid = messageId ? `${messageId}#${blockIdx}` : undefined;
 
-            return <CodeCard code={text} lang={lang} filePath={pathMatch?.[1]} />;
+            return (
+              <CodeCard
+                code={codeText}
+                lang={lang}
+                filePath={pathMatch?.[1]}
+                blockUid={blockUid}
+              />
+            );
           },
           // We render the card ourselves; let `pre` be a transparent passthrough.
           pre: ({ children }) => <>{children}</>,
