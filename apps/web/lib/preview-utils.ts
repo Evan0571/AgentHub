@@ -44,8 +44,22 @@ const PREVIEWABLE_LANGS = new Set([
   'javascript',
   'html',
   'htm',
+  'css',
   'vue',
 ]);
+
+export function langFromPath(filePath: string, content = ''): string {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('.tsx')) return 'tsx';
+  if (lower.endsWith('.jsx')) return 'jsx';
+  if (lower.endsWith('.ts')) return 'ts';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs')) return 'js';
+  if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'html';
+  if (lower.endsWith('.css')) return 'css';
+  if (lower.endsWith('.vue')) return 'vue';
+  if (/^\s*<!doctype html/i.test(content) || /^\s*<html[\s>]/i.test(content)) return 'html';
+  return 'text';
+}
 
 export function extractCodeBlocks(messages: readonly ChatMessage[]): CodeBlock[] {
   const out: CodeBlock[] = [];
@@ -91,7 +105,7 @@ export function isRunnable(block: CodeBlock): boolean {
 export function canonicalName(block: CodeBlock): string {
   if (block.path) {
     const base = block.path.split(/[\\/]/).pop() ?? block.path;
-    return base.replace(/\.(tsx?|jsx?|vue)$/i, '');
+    return base.replace(/\.(tsx?|jsx?|vue|html?|css|mjs)$/i, '');
   }
   return `inline_${block.uid.replace(/[^a-zA-Z0-9]/g, '_')}`;
 }
@@ -134,12 +148,7 @@ export function buildPreview(
   const entryLang = entry.lang.toLowerCase();
 
   if (entryLang === 'html' || entryLang === 'htm') {
-    return {
-      kind: 'html',
-      entryName,
-      fileCount: 1,
-      html: ensureHtmlScaffold(entry.code),
-    };
+    return buildHtmlProject(files, entry);
   }
 
   return buildReactProject(files, entryName);
@@ -147,11 +156,15 @@ export function buildPreview(
 
 function pickEntry(files: CodeBlock[]): CodeBlock | undefined {
   const byName = new Map(files.map((b) => [canonicalName(b), b] as const));
+  for (const name of ['index', 'Index', 'App', 'main', 'Main']) {
+    const b = byName.get(name);
+    if (b && ['html', 'htm'].includes(b.lang.toLowerCase())) return b;
+  }
   for (const name of ['App', 'main', 'Main', 'index', 'Index']) {
     const b = byName.get(name);
-    if (b) return b;
+    if (b && b.lang.toLowerCase() !== 'css') return b;
   }
-  return files[files.length - 1];
+  return files.find((f) => f.lang.toLowerCase() !== 'css') ?? files[files.length - 1];
 }
 
 function buildReactProject(blocks: CodeBlock[], entryName: string): PreviewBuildResult {
@@ -159,7 +172,16 @@ function buildReactProject(blocks: CodeBlock[], entryName: string): PreviewBuild
 
   // Pass 1: rewrite all relative imports so they resolve to basename in the import map.
   const files: Record<string, string> = {};
+  const cssFiles: Record<string, string> = {};
   for (const b of blocks) {
+    const lang = b.lang.toLowerCase();
+    if (lang === 'css') {
+      cssFiles[b.path ?? canonicalName(b)] = b.code;
+      continue;
+    }
+    if (lang === 'html' || lang === 'htm') {
+      continue;
+    }
     const name = canonicalName(b);
     files[name] = flattenLocalImports(b.code, known);
   }
@@ -176,7 +198,53 @@ function buildReactProject(blocks: CodeBlock[], entryName: string): PreviewBuild
     kind: 'react',
     entryName,
     fileCount: blocks.length,
-    html: buildReactHtml(files, entryName),
+    html: buildReactHtml(files, entryName, cssFiles),
+  };
+}
+
+function buildHtmlProject(blocks: CodeBlock[], entry: CodeBlock): PreviewBuildResult {
+  const filesByPath = new Map<string, CodeBlock>();
+  const filesByBase = new Map<string, CodeBlock>();
+  for (const b of blocks) {
+    if (!b.path) continue;
+    const normalized = normalizeRef(b.path);
+    filesByPath.set(normalized, b);
+    filesByPath.set(`./${normalized}`, b);
+    filesByBase.set(b.path.split(/[\\/]/).pop() ?? b.path, b);
+  }
+
+  const referenced = new Set<string>();
+  let html = ensureHtmlScaffold(entry.code);
+  html = html.replace(/<link\b([^>]*?)href=["']([^"']+)["']([^>]*)>/gi, (full, before, href, after) => {
+    const file = findLocalRef(href, filesByPath, filesByBase);
+    if (!file || file.lang.toLowerCase() !== 'css') return full;
+    referenced.add(file.path ?? href);
+    return `<style data-agenthub-inline="${escapeHtml(href)}">\n${file.code}\n</style>`;
+  });
+  html = html.replace(/<script\b([^>]*?)src=["']([^"']+)["']([^>]*)>\s*<\/script>/gi, (full, before, src, after) => {
+    const file = findLocalRef(src, filesByPath, filesByBase);
+    if (!file || !['js', 'javascript', 'mjs'].includes(file.lang.toLowerCase())) return full;
+    referenced.add(file.path ?? src);
+    return `<script${before}${after}>\n${file.code}\n</script>`;
+  });
+
+  const extraCss = blocks
+    .filter((b) => b.lang.toLowerCase() === 'css' && b.path && !referenced.has(b.path))
+    .map((b) => `\n<style data-agenthub-extra="${escapeHtml(b.path!)}">\n${b.code}\n</style>`)
+    .join('');
+  const extraJs = blocks
+    .filter((b) => ['js', 'javascript', 'mjs'].includes(b.lang.toLowerCase()) && b.path && !referenced.has(b.path))
+    .map((b) => `\n<script data-agenthub-extra="${escapeHtml(b.path!)}">\n${b.code}\n</script>`)
+    .join('');
+
+  if (extraCss) html = html.replace(/<\/head>/i, `${extraCss}\n</head>`);
+  if (extraJs) html = html.replace(/<\/body>/i, `${extraJs}\n</body>`);
+
+  return {
+    kind: 'html',
+    entryName: canonicalName(entry),
+    fileCount: blocks.length,
+    html,
   };
 }
 
@@ -278,7 +346,11 @@ function stubForBinding(binding: string): string {
   return decls.join(' ');
 }
 
-function buildReactHtml(files: Record<string, string>, entryName: string): string {
+function buildReactHtml(
+  files: Record<string, string>,
+  entryName: string,
+  cssFiles: Record<string, string> = {},
+): string {
   // The runtime boot script is intentionally written as a string template so we
   // can embed user files via JSON.stringify and have Babel + esm.sh do the rest
   // in the iframe.
@@ -295,6 +367,9 @@ function buildReactHtml(files: Record<string, string>, entryName: string): strin
   .agenthub-err { font-family: ui-monospace, monospace; background:#fef2f2; color:#991b1b; padding:12px; border-radius:8px; white-space:pre-wrap; font-size:12px; margin:8px 0; }
   .agenthub-loading { font-size:12px; color:#6b7280; }
 </style>
+${Object.entries(cssFiles)
+  .map(([name, css]) => `<style data-agenthub-css="${escapeHtml(name)}">\n${css}\n</style>`)
+  .join('\n')}
 </head>
 <body>
 <div id="__loading" class="agenthub-loading">⏳ Preview 编译中…</div>
@@ -463,4 +538,18 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] ?? c),
   );
+}
+
+function normalizeRef(ref: string): string {
+  return ref.replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, '');
+}
+
+function findLocalRef(
+  ref: string,
+  filesByPath: Map<string, CodeBlock>,
+  filesByBase: Map<string, CodeBlock>,
+): CodeBlock | undefined {
+  if (/^(https?:|data:|blob:|#)/i.test(ref)) return undefined;
+  const normalized = normalizeRef(ref);
+  return filesByPath.get(normalized) ?? filesByPath.get(`./${normalized}`) ?? filesByBase.get(normalized.split('/').pop() ?? normalized);
 }

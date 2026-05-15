@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   Copy,
@@ -18,7 +18,29 @@ import {
   EMPTY_DEPLOYMENTS,
   type Deployment,
 } from '@/lib/store';
-import { buildPreview, extractCodeBlocks, isRunnable } from '@/lib/preview-utils';
+import {
+  buildPreview,
+  extractCodeBlocks,
+  isRunnable,
+  langFromPath,
+  type CodeBlock,
+} from '@/lib/preview-utils';
+
+interface WorkspaceFileEntry {
+  path: string;
+  type: 'file' | 'directory';
+  size?: number;
+}
+
+interface WorkspaceListResult {
+  files: WorkspaceFileEntry[];
+}
+
+interface WorkspaceReadResult {
+  path: string;
+  content: string;
+  size: number;
+}
 
 export function DeployPanel() {
   const activeId = useConversationStore((s) => s.activeId);
@@ -32,8 +54,61 @@ export function DeployPanel() {
     (s) => (s.activeId ? s.deploymentsByConv[s.activeId] : undefined) ?? EMPTY_DEPLOYMENTS,
   );
   const triggerDeploy = useConversationStore((s) => s.triggerDeploy);
+  const [workspaceBlocks, setWorkspaceBlocks] = useState<CodeBlock[]>([]);
 
-  const blocks = useMemo(() => extractCodeBlocks(messages).filter(isRunnable), [messages]);
+  useEffect(() => {
+    if (!activeId) {
+      setWorkspaceBlocks([]);
+      return;
+    }
+
+    let cancelled = false;
+    const loadWorkspaceFiles = async () => {
+      try {
+        const listRes = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(activeId)}/workspace`));
+        if (!listRes.ok) throw new Error(`workspace ${listRes.status}`);
+        const list = (await listRes.json()) as WorkspaceListResult;
+        const previewable = list.files
+          .filter((f) => f.type === 'file')
+          .filter((f) => /\.(tsx?|jsx?|mjs|html?|css|vue)$/i.test(f.path))
+          .filter((f) => (f.size ?? 0) <= 1_000_000)
+          .slice(0, 60);
+
+        const blocks = await Promise.all(
+          previewable.map(async (f) => {
+            const res = await fetch(
+              apiUrl(
+                `/api/conversations/${encodeURIComponent(activeId)}/workspace/file?path=${encodeURIComponent(f.path)}&maxBytes=1000000`,
+              ),
+            );
+            if (!res.ok) throw new Error(`read ${f.path}: ${res.status}`);
+            const file = (await res.json()) as WorkspaceReadResult;
+            return {
+              uid: `workspace:${file.path}:${file.size}`,
+              fromMessageId: 'workspace',
+              lang: langFromPath(file.path, file.content),
+              path: file.path,
+              code: file.content,
+            } satisfies CodeBlock;
+          }),
+        );
+
+        if (!cancelled) setWorkspaceBlocks(blocks.filter(isRunnable));
+      } catch {
+        if (!cancelled) setWorkspaceBlocks([]);
+      }
+    };
+
+    void loadWorkspaceFiles();
+    const timer = window.setInterval(() => void loadWorkspaceFiles(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeId]);
+
+  const chatBlocks = useMemo(() => extractCodeBlocks(messages).filter(isRunnable), [messages]);
+  const blocks = workspaceBlocks.length > 0 ? workspaceBlocks : chatBlocks;
   const built = useMemo(() => buildPreview(blocks, null), [blocks]);
   const canDeploy = built.kind !== 'unsupported' && !!built.html;
   const htmlKB = built.html ? Math.ceil(built.html.length / 1024) : 0;
@@ -265,6 +340,11 @@ function StatusBadge({ status }: { status: Deployment['status'] }) {
   return (
     <span className={clsx('rounded px-1.5 py-0.5 text-[10px] font-medium', m.cls)}>{m.text}</span>
   );
+}
+
+function apiUrl(path: string): string {
+  if (typeof window === 'undefined') return `http://localhost:4000${path}`;
+  return `http://${window.location.hostname}:4000${path}`;
 }
 
 function slug(s: string): string {

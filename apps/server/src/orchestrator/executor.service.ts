@@ -1,13 +1,24 @@
 import { Inject, Injectable } from '@nestjs/common';
-import type { AdapterRegistry, ChatRequest } from '@agenthub/adapter-core';
+import type { AdapterRegistry, AgentAdapter, ChatRequest } from '@agenthub/adapter-core';
 import type { Plan, PlanTask, ServerEvent, TaskStatus } from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
+import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import { CriticService } from './critic.service.js';
 import { PlanService } from './plan.service.js';
 import { MessagesRepo } from '../db/messages.repo.js';
+import { AgentsRepo } from '../db/agents.repo.js';
+import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
 
 const MAX_PARALLEL = 5;
 const MAX_RETRIES = 1;
+
+interface ResolvedExecutorAgent {
+  agentId: string;
+  adapterId: string;
+  name: string;
+  systemPrompt: string;
+  adapter: AgentAdapter;
+}
 
 @Injectable()
 export class ExecutorService {
@@ -18,6 +29,9 @@ export class ExecutorService {
     private readonly critic: CriticService,
     private readonly plans: PlanService,
     private readonly messages: MessagesRepo,
+    private readonly agents: AgentsRepo,
+    private readonly adapterFactory: AdapterFactoryService,
+    private readonly toolRunner: AgentToolRunnerService,
   ) {}
 
   /**
@@ -93,15 +107,9 @@ export class ExecutorService {
   ): Promise<void> {
     this.markTask(plan, task, 'running', send);
 
-    const adapterId =
-      task.assigneeAgentId && this.registry.has(task.assigneeAgentId)
-        ? task.assigneeAgentId
-        : this.registry.has('deepseek-v3')
-          ? 'deepseek-v3'
-          : 'mock';
-
-    const adapter = this.registry.get(adapterId);
-    task.assigneeAgentId = adapterId;
+    const assignee = await this.resolveAssignee(task.assigneeAgentId);
+    const { adapter, agentId, adapterId } = assignee;
+    task.assigneeAgentId = agentId;
     task.startedAt = new Date().toISOString();
 
     const msgId = cryptoRandomId();
@@ -114,7 +122,7 @@ export class ExecutorService {
         id: msgId,
         conversationId: plan.conversationId,
         senderType: 'agent',
-        senderId: adapterId,
+        senderId: agentId,
         createdAt: new Date().toISOString(),
       },
     });
@@ -141,8 +149,18 @@ export class ExecutorService {
         taskId: task.id,
         taskGoal: task.goal,
         conversationId: plan.conversationId,
+        agentId,
+        adapterId,
+        agentName: assignee.name,
+      },
+      workspace: {
+        id: plan.conversationId,
+        snapshotId: 'head',
       },
       systemPrompt:
+        (assignee.systemPrompt
+          ? `## 你的角色：${assignee.name}\n\n${assignee.systemPrompt.trim()}\n\n`
+          : '') +
         '你是 AgentHub Orchestrator 编排下的子任务执行 Agent。\n\n' +
         '**输出要求**（必须严格遵守）：\n' +
         '1. 说明性文字极度简洁（≤ 250 字）；代码块本身不计入字数。\n' +
@@ -161,24 +179,17 @@ export class ExecutorService {
     let output = '';
     let errored = false;
     try {
-      for await (const ev of adapter.chat(req, ctrl.signal)) {
-        switch (ev.type) {
-          case 'token':
-            output += ev.text;
-            send({ op: 'msg_token', msgId, delta: ev.text });
-            break;
-          case 'thinking':
-            send({ op: 'msg_thinking', msgId, delta: ev.text });
-            break;
-          case 'done':
-            send({ op: 'msg_done', msgId, usage: ev.usage });
-            break;
-          case 'error':
-            errored = true;
-            send({ op: 'msg_error', msgId, error: ev.error });
-            break;
-        }
-      }
+      const run = await this.toolRunner.run({
+        adapter,
+        request: req,
+        conversationId: plan.conversationId,
+        msgId,
+        send,
+        signal: ctrl.signal,
+        maxToolRounds: 32,
+      });
+      output = run.output;
+      errored = run.errored;
     } finally {
       this.aborts.delete(task.id);
     }
@@ -201,11 +212,11 @@ export class ExecutorService {
     // Persist the assembled agent message (with task header) for hydration.
     void this.messages
       .insert({
-        conversationSlug: plan.conversationId,
-        senderType: 'agent',
-        senderId: adapterId,
-        text: header + output,
-      })
+          conversationSlug: plan.conversationId,
+          senderType: 'agent',
+          senderId: agentId,
+          text: header + output,
+        })
       .catch(() => undefined);
 
     // ---- Critic gate -----------------------------------------------------
@@ -283,6 +294,54 @@ export class ExecutorService {
         text,
       })
       .catch(() => undefined);
+  }
+
+  private async resolveAssignee(preferred?: string): Promise<ResolvedExecutorAgent> {
+    if (preferred) {
+      const agent = await this.agents.getByIdWithSecrets(preferred);
+      if (agent) {
+        const adapter = this.adapterFactory.resolveForAgent({
+          agentId: agent.id,
+          adapterId: agent.adapterId,
+          model: agent.model,
+          apiKey: agent.apiKey,
+          baseUrl: agent.baseUrl,
+        });
+        return {
+          agentId: agent.id,
+          adapterId: agent.adapterId,
+          name: agent.name,
+          systemPrompt: agent.systemPrompt ?? '',
+          adapter,
+        };
+      }
+
+      if (this.registry.has(preferred)) {
+        return {
+          agentId: preferred,
+          adapterId: preferred,
+          name: preferred,
+          systemPrompt: '',
+          adapter: this.registry.get(preferred),
+        };
+      }
+    }
+
+    const fallback = this.fallbackAdapterId();
+    return {
+      agentId: fallback,
+      adapterId: fallback,
+      name: fallback,
+      systemPrompt: '',
+      adapter: this.registry.get(fallback),
+    };
+  }
+
+  private fallbackAdapterId(): string {
+    for (const id of ['codex', 'deepseek-v3', 'deepseek-r1', 'mock']) {
+      if (this.registry.has(id)) return id;
+    }
+    return 'mock';
   }
 
   private markTask(

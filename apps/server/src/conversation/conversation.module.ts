@@ -6,9 +6,10 @@ import { MentionRouter } from './mention-router.js';
 import { ReplayService } from './replay.service.js';
 import { OrchestratorModule } from '../orchestrator/orchestrator.module.js';
 import { DeployModule } from '../deploy/deploy.module.js';
+import { WorkspaceModule } from '../workspace/workspace.module.js';
 
 @Module({
-  imports: [OrchestratorModule, DeployModule],
+  imports: [OrchestratorModule, DeployModule, WorkspaceModule],
   providers: [ConversationGateway, ConversationService, MentionRouter, ReplayService],
   controllers: [ConversationController],
   exports: [ConversationService],

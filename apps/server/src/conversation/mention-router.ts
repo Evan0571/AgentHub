@@ -8,6 +8,7 @@ import { MessagesRepo } from '../db/messages.repo.js';
 import { AgentsRepo } from '../db/agents.repo.js';
 import { ConversationsRepo } from '../db/conversations.repo.js';
 import { TracingService } from '../observability/tracing.service.js';
+import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
 
 interface ResolvedAgent {
   agentId: string;          // the canonical agent id (UUID or built-in slug)
@@ -54,6 +55,7 @@ export class MentionRouter {
     private readonly agentsRepo: AgentsRepo,
     private readonly convsRepo: ConversationsRepo,
     private readonly adapterFactory: AdapterFactoryService,
+    private readonly toolRunner: AgentToolRunnerService,
   ) {}
 
   async route(
@@ -220,6 +222,10 @@ export class MentionRouter {
       taskId: msgId,
       systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules),
       messages: [{ role: 'user', content: args.userText }],
+      workspace: {
+        id: args.conversationId,
+        snapshotId: 'head',
+      },
       metadata: {
         purpose: 'chat',
         agentId: args.self.agentId,
@@ -240,40 +246,14 @@ export class MentionRouter {
       },
     });
 
-    let assembled = '';
-    for await (const ev of adapter.chat(req)) {
-      switch (ev.type) {
-        case 'token':
-          assembled += ev.text;
-          args.send({ op: 'msg_token', msgId, delta: ev.text });
-          break;
-        case 'thinking':
-          args.send({ op: 'msg_thinking', msgId, delta: ev.text });
-          break;
-        case 'file_patch':
-          args.send({
-            op: 'patch',
-            msgId,
-            snapshotId: cryptoRandomId(),
-            files: [
-              {
-                path: ev.path,
-                status: 'modified',
-                additions: 0,
-                deletions: 0,
-                hunks: [{ id: cryptoRandomId(), header: ev.path }],
-              },
-            ],
-          });
-          break;
-        case 'done':
-          args.send({ op: 'msg_done', msgId, usage: ev.usage });
-          break;
-        case 'error':
-          args.send({ op: 'msg_error', msgId, error: ev.error });
-          break;
-      }
-    }
+    const run = await this.toolRunner.run({
+      adapter,
+      request: req,
+      conversationId: args.conversationId,
+      msgId,
+      send: args.send,
+    });
+    const assembled = run.output;
 
     if (assembled.trim()) {
       void this.messages

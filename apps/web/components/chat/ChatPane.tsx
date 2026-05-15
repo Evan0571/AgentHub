@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Send, AtSign } from 'lucide-react';
 import { MessageList } from './MessageList';
-import { useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
 import { Banner } from '../Banner';
 import { MembersPanel } from './MembersPanel';
@@ -44,13 +44,21 @@ export function ChatPane() {
 
   const candidates: MentionCandidate[] = useMemo(() => {
     if (!active) return [];
-    return active.members.map((m) => ({
+    return active.members.filter((m) => !isHiddenSystemAgentId(m.agentId)).map((m) => ({
       id: m.agentId,
       name: m.name,
       color: m.avatarColor,
       hint: describe(m.adapterId),
     }));
   }, [active]);
+  const visibleMembers = useMemo(
+    () => active?.members.filter((m) => !isHiddenSystemAgentId(m.agentId)) ?? [],
+    [active],
+  );
+  const visibleDefaultAgentId =
+    active?.targetAgentId && !isHiddenSystemAgentId(active.targetAgentId)
+      ? active.targetAgentId
+      : visibleMembers[0]?.agentId;
 
   if (!active) {
     return (
@@ -147,7 +155,7 @@ export function ChatPane() {
         <div>
           <div className="font-medium">{active.title}</div>
           <div className="text-xs text-text-muted">
-            {active.members.length} 个成员 · {active.type === 'group' ? '群聊' : '单聊'}
+            {visibleMembers.length} 个成员 · {active.type === 'group' ? '群聊' : '单聊'}
           </div>
         </div>
       </header>
@@ -210,8 +218,8 @@ export function ChatPane() {
         </div>
         <div className="mt-1 px-1 text-[10px] text-text-muted/70">
           {active.type === 'group'
-            ? `成员：${active.members.map((m) => m.name).join('，')}`
-            : `本会话默认 @${active.targetAgentId ?? active.members[0]?.agentId ?? ''}`}
+            ? `成员：${visibleMembers.map((m) => m.name).join('，')}`
+            : `本会话默认 @${visibleDefaultAgentId ?? ''}`}
         </div>
       </footer>
 

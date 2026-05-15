@@ -1,9 +1,9 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Loader2, MessageSquare, Sparkles, Users, X } from 'lucide-react';
 import clsx from 'clsx';
-import { useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
 
@@ -13,6 +13,18 @@ const DEFAULT_GROUP_RULES = `- 全员使用中文回复，结论先行、简洁�
 - 修改已有文件优先输出 unified diff（语言标 \`diff\`），不要重发整文件
 - 多 Agent 协作时只产出自己负责的部分，不替别人写、不做横向对比
 - 完成后用一句话总结改动`;
+
+const PROJECT_TEAM_IDS = [
+  'product-analyst',
+  'solution-architect',
+  'frontend-engineer',
+  'backend-engineer',
+  'code-reviewer',
+  'env-engineer',
+  'qa-tester',
+  'senior-user',
+  'risk-critic',
+];
 
 /**
  * Modal: pick conv type, name it, choose initial members.
@@ -26,18 +38,29 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const [title, setTitle] = useState('');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [groupRules, setGroupRules] = useState('');
+  const [didAutoSelectTeam, setDidAutoSelectTeam] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   // Built-in agents come first, then user-created ones.
   const sortedAgents = useMemo(
     () =>
-      [...agents].sort((a, b) => {
+      agents.filter((a) => !isHiddenSystemAgentId(a.id)).sort((a, b) => {
         if (a.isPublic !== b.isPublic) return a.isPublic ? -1 : 1;
         return a.name.localeCompare(b.name);
       }),
     [agents],
   );
+  const projectTeamIds = useMemo(
+    () => PROJECT_TEAM_IDS.filter((id) => agents.some((a) => a.id === id)),
+    [agents],
+  );
+
+  useEffect(() => {
+    if (type !== 'group' || didAutoSelectTeam || selected.size > 0 || projectTeamIds.length === 0) return;
+    setSelected(new Set(projectTeamIds));
+    setDidAutoSelectTeam(true);
+  }, [didAutoSelectTeam, projectTeamIds, selected.size, type]);
 
   const toggle = (id: string) => {
     setSelected((prev) => {
@@ -115,7 +138,16 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
             </span>
             {type === 'single' ? (
               <span className="text-[10px] text-text-muted/70">单聊只能选 1 个</span>
-            ) : null}
+            ) : (
+              <button
+                type="button"
+                onClick={() => setSelected(new Set(projectTeamIds))}
+                disabled={projectTeamIds.length === 0}
+                className="rounded px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/10 disabled:opacity-40"
+              >
+                选择标准项目团队
+              </button>
+            )}
           </div>
           <div className="mt-0.5 max-h-64 space-y-1 overflow-y-auto rounded-md border border-white/5 bg-bg/40 p-1">
             {sortedAgents.length === 0 ? (

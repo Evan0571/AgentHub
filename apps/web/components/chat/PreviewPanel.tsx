@@ -9,8 +9,25 @@ import {
   canonicalName,
   extractCodeBlocks,
   isRunnable,
+  langFromPath,
   type CodeBlock,
 } from '@/lib/preview-utils';
+
+interface WorkspaceFileEntry {
+  path: string;
+  type: 'file' | 'directory';
+  size?: number;
+}
+
+interface WorkspaceListResult {
+  files: WorkspaceFileEntry[];
+}
+
+interface WorkspaceReadResult {
+  path: string;
+  content: string;
+  size: number;
+}
 
 export function PreviewPanel() {
   const activeId = useConversationStore((s) => s.activeId);
@@ -19,13 +36,75 @@ export function PreviewPanel() {
   );
   const previewBlockUid = useConversationStore((s) => s.previewBlockUid);
   const openPreview = useConversationStore((s) => s.openPreview);
+  const [workspaceBlocks, setWorkspaceBlocks] = useState<CodeBlock[]>([]);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
 
-  const allBlocks = useMemo(
+  useEffect(() => {
+    if (!activeId) {
+      setWorkspaceBlocks([]);
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadWorkspaceFiles = async () => {
+      try {
+        const listRes = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(activeId)}/workspace`));
+        if (!listRes.ok) throw new Error(`workspace ${listRes.status}`);
+        const list = (await listRes.json()) as WorkspaceListResult;
+        const previewable = list.files
+          .filter((f) => f.type === 'file')
+          .filter((f) => /\.(tsx?|jsx?|mjs|html?|css|vue)$/i.test(f.path))
+          .filter((f) => (f.size ?? 0) <= 1_000_000)
+          .slice(0, 60);
+
+        const blocks = await Promise.all(
+          previewable.map(async (f) => {
+            const res = await fetch(
+              apiUrl(
+                `/api/conversations/${encodeURIComponent(activeId)}/workspace/file?path=${encodeURIComponent(f.path)}&maxBytes=1000000`,
+              ),
+            );
+            if (!res.ok) throw new Error(`read ${f.path}: ${res.status}`);
+            const file = (await res.json()) as WorkspaceReadResult;
+            return {
+              uid: `workspace:${file.path}:${file.size}`,
+              fromMessageId: 'workspace',
+              lang: langFromPath(file.path, file.content),
+              path: file.path,
+              code: file.content,
+            } satisfies CodeBlock;
+          }),
+        );
+
+        if (!cancelled) {
+          setWorkspaceBlocks(blocks.filter(isRunnable));
+          setWorkspaceError(null);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setWorkspaceBlocks([]);
+          setWorkspaceError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    };
+
+    void loadWorkspaceFiles();
+    const timer = window.setInterval(() => void loadWorkspaceFiles(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeId]);
+
+  const chatBlocks = useMemo(
     () => extractCodeBlocks(messages).filter(isRunnable),
     [messages],
   );
 
-  // Latest-version-per-file collapse for the picker (same logic as buildPreview).
+  const allBlocks = workspaceBlocks.length > 0 ? workspaceBlocks : chatBlocks;
+  const source = workspaceBlocks.length > 0 ? 'workspace' : 'chat';
+
   const files = useMemo(() => {
     const byName = new Map<string, CodeBlock>();
     for (const b of allBlocks) byName.set(canonicalName(b), b);
@@ -37,14 +116,19 @@ export function PreviewPanel() {
     [allBlocks, previewBlockUid],
   );
 
-  if (!activeId) return <div className="text-sm text-text-muted">先打开一个会话。</div>;
+  if (!activeId) return <div className="text-sm text-text-muted">Open a conversation first.</div>;
 
   if (files.length === 0) {
     return (
       <div className="text-sm text-text-muted">
-        当前会话还没有可预览的代码块。让 Agent 用{' '}
+        {workspaceError ? (
+          <div className="mb-2 rounded border border-rose-500/30 bg-rose-500/10 p-2 text-xs text-rose-200">
+            Workspace preview failed: {workspaceError}
+          </div>
+        ) : null}
+        当前项目还没有可预览文件。让 Agent 写入真实 workspace 文件，或输出{' '}
         <code className="rounded bg-white/10 px-1">```tsx path=...</code>{' '}
-        输出代码，这里就会出现"运行"按钮。
+        代码块后会出现在这里。
       </div>
     );
   }
@@ -54,6 +138,7 @@ export function PreviewPanel() {
       <FilePicker
         files={files}
         entryName={built.entryName}
+        source={source}
         onSelect={(uid) => openPreview(uid, { setEntry: true })}
       />
       <SandboxFrame
@@ -71,17 +156,19 @@ export function PreviewPanel() {
 function FilePicker({
   files,
   entryName,
+  source,
   onSelect,
 }: {
   files: CodeBlock[];
   entryName: string | undefined;
+  source: 'workspace' | 'chat';
   onSelect: (uid: string) => void;
 }) {
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-1 px-1 text-[10px] uppercase tracking-wider text-text-muted">
         <Layers className="h-3 w-3" />
-        项目文件（{files.length}） · 入口
+        项目文件（{files.length}） · {source === 'workspace' ? 'workspace' : 'chat blocks'} · 入口
         <span className="ml-1 rounded bg-accent/20 px-1 py-px font-mono text-accent">
           {entryName ?? '-'}
         </span>
@@ -153,7 +240,7 @@ function SandboxFrame({
   if (kind === 'unsupported') {
     return (
       <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-200">
-        ⚠️ {reason} —— 当前 Preview 支持 React / 单文件 HTML。
+        {reason} 当前 Preview 支持 React / 单文件 HTML / 静态 HTML+CSS+JS。
       </div>
     );
   }
@@ -212,4 +299,9 @@ function SandboxFrame({
       )}
     </div>
   );
+}
+
+function apiUrl(path: string): string {
+  if (typeof window === 'undefined') return `http://localhost:4000${path}`;
+  return `http://${window.location.hostname}:4000${path}`;
 }

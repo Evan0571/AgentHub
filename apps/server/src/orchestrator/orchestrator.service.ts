@@ -46,14 +46,15 @@ export class OrchestratorService {
     send: (e: ServerEvent) => void,
   ): Promise<Plan> {
     const planningMsgId = cryptoRandomId();
-    const intro = `🧭 正在拆解目标：\n\n> ${input.rootGoal}\n\n_调用 Planner 模型中…_`;
+    const plannerAgent = await this.planner.getPlannerProfile(input.conversationId);
+    const intro = `🧭 ${plannerAgent ? `${plannerAgent.name} 正在做架构规划` : '正在拆解目标'}：\n\n> ${input.rootGoal}\n\n_调用${plannerAgent ? '项目架构师' : ' Planner 模型'}中…_`;
     send({
       op: 'msg_started',
       message: {
         id: planningMsgId,
         conversationId: input.conversationId,
-        senderType: 'system',
-        senderId: 'orchestrator',
+        senderType: plannerAgent ? 'agent' : 'system',
+        senderId: plannerAgent?.agentId ?? 'orchestrator',
         createdAt: new Date().toISOString(),
       },
     });
@@ -78,8 +79,8 @@ export class OrchestratorService {
       void this.messages
         .insert({
           conversationSlug: input.conversationId,
-          senderType: 'system',
-          senderId: 'orchestrator',
+          senderType: plannerAgent ? 'agent' : 'system',
+          senderId: plannerAgent?.agentId ?? 'orchestrator',
           text: intro + failText,
         })
         .catch(() => undefined);
@@ -95,8 +96,8 @@ export class OrchestratorService {
     void this.messages
       .insert({
         conversationSlug: input.conversationId,
-        senderType: 'system',
-        senderId: 'orchestrator',
+        senderType: plannerAgent ? 'agent' : 'system',
+        senderId: plannerAgent?.agentId ?? 'orchestrator',
         text: intro + summary,
       })
       .catch(() => undefined);

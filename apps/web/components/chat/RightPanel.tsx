@@ -6,6 +6,7 @@ import { useConversationStore } from '@/lib/store';
 import { PlanCard } from './PlanCard';
 import { PreviewPanel } from './PreviewPanel';
 import { DeployPanel } from './DeployPanel';
+import { WorkspacePanel } from './WorkspacePanel';
 
 export function RightPanel() {
   const tab = useConversationStore((s) => s.rightPanelTab);
@@ -38,17 +39,13 @@ export function RightPanel() {
       </nav>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4 text-sm">
-        {tab === 'workspace' && (
-          <div className="text-text-muted">
-            文件树 / Diff 视图（v1 占位 — 后续接入 Workspace 快照存储）
-          </div>
-        )}
+        {tab === 'workspace' && <WorkspacePanel />}
         {tab === 'plan' &&
           (plan ? (
             <PlanCard plan={plan} />
           ) : (
             <div className="text-text-muted">
-              当前会话还没有 Plan。在群聊里发送 <code className="rounded bg-white/10 px-1">@orchestrator 你的目标</code> 即可触发任务拆解。
+              当前会话还没有 Plan。在项目群里直接发送目标，系统会按团队角色触发任务拆解。
             </div>
           ))}
         {tab === 'preview' && <PreviewPanel />}

@@ -17,6 +17,7 @@ import { ConversationsRepo, type ConversationSummary } from '../db/conversations
 import { AgentsRepo, type AgentDescriptor } from '../db/agents.repo.js';
 import { PlanService } from '../orchestrator/plan.service.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
+import { WorkspaceService } from '../workspace/workspace.service.js';
 
 export interface ConversationStateResponse {
   conversationId: string;
@@ -76,6 +77,7 @@ export class ConversationController {
     private readonly convs: ConversationsRepo,
     private readonly agents: AgentsRepo,
     private readonly adapterFactory: AdapterFactoryService,
+    private readonly workspace: WorkspaceService,
   ) {}
 
   // ----- conversations ----------------------------------------------------
@@ -89,12 +91,19 @@ export class ConversationController {
   async create(@Body() body: unknown): Promise<ConversationSummary> {
     const parsed = CreateConversationSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
-    return this.convs.create({
+    const conv = await this.convs.create({
       type: parsed.data.type,
       title: parsed.data.title,
       groupSystemPrompt: parsed.data.groupSystemPrompt ?? null,
       memberAgentIds: parsed.data.memberAgentIds,
     });
+    if (parsed.data.type === 'group') {
+      await this.workspace.initializeProject(conv.id, {
+        title: parsed.data.title,
+        memberIds: parsed.data.memberAgentIds,
+      });
+    }
+    return conv;
   }
 
   @Put('conversations/:id')

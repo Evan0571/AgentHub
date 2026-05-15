@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react';
 import clsx from 'clsx';
 import { Eye, EyeOff, KeyRound, Loader2, Lock, Pencil, Plus, Trash2 } from 'lucide-react';
-import { useConversationStore, type AgentProfile } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore, type AgentProfile } from '@/lib/store';
 import { ModalShell } from './NewConversationDialog';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
@@ -98,6 +98,8 @@ const PROVIDERS: Provider[] = [
     models: [{ id: '', label: '(默认)' }],
   },
 ];
+
+const VISIBLE_PROVIDERS = PROVIDERS.filter((p) => p.id !== 'mock');
 
 function findProvider(adapterId: string): Provider {
   return PROVIDERS.find((p) => p.id === adapterId) ?? PROVIDERS[0]!;
@@ -211,7 +213,7 @@ export function ManageAgentsModal({ onClose }: { onClose: () => void }) {
 
   const sorted = useMemo(
     () =>
-      [...agents].sort((a, b) => {
+      agents.filter((a) => !isHiddenSystemAgentId(a.id)).sort((a, b) => {
         if (a.isPublic !== b.isPublic) return a.isPublic ? -1 : 1;
         return a.name.localeCompare(b.name);
       }),
@@ -446,7 +448,7 @@ function AgentForm({
         <span className="text-[10px] uppercase tracking-wider text-text-muted">底座 / Provider</span>
         {mode === 'create' ? (
           <div className="mt-0.5 grid grid-cols-2 gap-1.5">
-            {PROVIDERS.map((p) => (
+            {VISIBLE_PROVIDERS.map((p) => (
               <button
                 key={p.id}
                 type="button"

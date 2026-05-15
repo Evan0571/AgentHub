@@ -3,8 +3,11 @@ import type {
   ChatRequest,
   ChatEvent,
   CostEstimate,
+  FinishReason,
   HealthStatus,
   Message,
+  ToolCall,
+  ToolSchema,
   TokenUsage,
 } from '@agenthub/adapter-core';
 import { AdapterError, mapHttpStatus } from '@agenthub/adapter-core';
@@ -83,6 +86,9 @@ export class CodexAdapter implements AgentAdapter {
       messages: this.translateMessages(req.systemPrompt, req.messages),
       stream: true,
       stream_options: { include_usage: true },
+      ...(req.tools?.length
+        ? { tools: toOpenAITools(req.tools), tool_choice: 'auto' as const }
+        : {}),
       ...(req.budget?.maxTokens ? { max_tokens: req.budget.maxTokens } : {}),
     };
 
@@ -128,7 +134,8 @@ export class CodexAdapter implements AgentAdapter {
 
     let promptTokens = 0;
     let completionTokens = 0;
-    let finishReason: 'stop' | 'length' | 'error' = 'stop';
+    let finishReason: FinishReason = 'stop';
+    const toolCallParts = new Map<number, { id: string; name: string; arguments: string }>();
 
     try {
       for await (const chunk of parseSSE(response.body, signal)) {
@@ -147,19 +154,25 @@ export class CodexAdapter implements AgentAdapter {
         }
         if (delta?.tool_calls) {
           for (const tc of delta.tool_calls) {
-            if (!tc.function?.name) continue;
-            yield {
-              type: 'tool_call',
-              call: {
-                id: tc.id ?? `oai-${Date.now()}`,
-                name: tc.function.name,
-                args: safeJSON(tc.function.arguments),
-              },
+            const index = typeof tc.index === 'number' ? tc.index : toolCallParts.size;
+            const existing = toolCallParts.get(index) ?? {
+              id: tc.id ?? `oai-${Date.now()}-${index}`,
+              name: '',
+              arguments: '',
             };
+            if (tc.id) existing.id = tc.id;
+            if (tc.function?.name) existing.name = tc.function.name;
+            if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+            toolCallParts.set(index, existing);
           }
         }
         if (choice?.finish_reason) {
-          finishReason = choice.finish_reason === 'length' ? 'length' : 'stop';
+          finishReason =
+            choice.finish_reason === 'length'
+              ? 'length'
+              : choice.finish_reason === 'tool_calls'
+                ? 'tool_use'
+                : 'stop';
         }
         if (parsed.usage) {
           promptTokens = parsed.usage.prompt_tokens ?? promptTokens;
@@ -181,6 +194,10 @@ export class CodexAdapter implements AgentAdapter {
         cause: e,
       }).toEvent();
       return;
+    }
+
+    for (const call of finalizeToolCalls(toolCallParts)) {
+      yield { type: 'tool_call', call };
     }
 
     const usage: TokenUsage = {
@@ -215,7 +232,7 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private translateMessages(systemPrompt: string | undefined, msgs: Message[]) {
-    const out: Array<{ role: string; content: string; name?: string; tool_call_id?: string }> = [];
+    const out: Array<Record<string, unknown>> = [];
     if (systemPrompt) out.push({ role: 'system', content: systemPrompt });
     for (const m of msgs) {
       const content =
@@ -224,12 +241,23 @@ export class CodexAdapter implements AgentAdapter {
           : m.content
               .map((p) => (p.type === 'text' ? p.text : `[${p.type}]`))
               .join('\n');
-      out.push({
+      const row: Record<string, unknown> = {
         role: m.role,
-        content,
+        content: m.toolCalls?.length && m.role === 'assistant' && !content ? null : content,
         ...(m.name ? { name: m.name } : {}),
         ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
-      });
+      };
+      if (m.toolCalls?.length) {
+        row.tool_calls = m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: {
+            name: tc.name,
+            arguments: JSON.stringify(tc.args ?? {}),
+          },
+        }));
+      }
+      out.push(row);
     }
     return out;
   }
@@ -279,6 +307,30 @@ function safeJSON(s: unknown): unknown {
   } catch {
     return s;
   }
+}
+
+function toOpenAITools(tools: ToolSchema[]) {
+  return tools.map((tool) => ({
+    type: 'function',
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  }));
+}
+
+function finalizeToolCalls(
+  parts: Map<number, { id: string; name: string; arguments: string }>,
+): ToolCall[] {
+  return [...parts.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, part]) => ({
+      id: part.id,
+      name: part.name,
+      args: safeJSON(part.arguments || '{}'),
+    }))
+    .filter((call) => call.name);
 }
 
 function roughTokens(req: ChatRequest): number {

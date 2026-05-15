@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Pencil, Plus, Trash2, UserMinus, X } from 'lucide-react';
 import clsx from 'clsx';
-import { useConversationStore, type ChatConversation } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore, type ChatConversation } from '@/lib/store';
 import { ModalShell } from './NewConversationDialog';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
@@ -44,8 +44,12 @@ export function MembersPanel({
     () => new Set(conversation.members.map((m) => m.agentId)),
     [conversation.members],
   );
+  const visibleMembers = useMemo(
+    () => conversation.members.filter((m) => !isHiddenSystemAgentId(m.agentId)),
+    [conversation.members],
+  );
   const candidates = useMemo(
-    () => agents.filter((a) => !memberIds.has(a.id)),
+    () => agents.filter((a) => !isHiddenSystemAgentId(a.id) && !memberIds.has(a.id)),
     [agents, memberIds],
   );
 
@@ -169,14 +173,14 @@ export function MembersPanel({
         <div>
           <div className="flex items-baseline justify-between">
             <span className="text-[10px] uppercase tracking-wider text-text-muted">
-              成员（{conversation.members.length}）
+              成员（{visibleMembers.length}）
             </span>
             <span className="text-[10px] text-text-muted/70">
               {isGroup ? '群聊 · @ 路由' : '单聊'}
             </span>
           </div>
           <ul className="mt-0.5 space-y-0.5 rounded-md border border-white/5 bg-bg/40 p-1">
-            {conversation.members.map((m) => (
+            {visibleMembers.map((m) => (
               <li
                 key={m.agentId}
                 className="flex items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-white/5"

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Plus, Search, Settings, Sparkles, Trash2, Users } from 'lucide-react';
-import { useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 import { NewConversationDialog } from './NewConversationDialog';
 import { ManageAgentsModal } from './ManageAgentsModal';
 import { ThemeToggle } from '../ThemeToggle';
@@ -81,9 +81,11 @@ export function Sidebar() {
         ) : (
           filtered.map((c) => {
             const isActive = c.id === activeId;
+            const visibleMembers = c.members.filter((m) => !isHiddenSystemAgentId(m.agentId));
+            const primaryMember = visibleMembers[0] ?? c.members[0];
             const subtitle = c.type === 'group'
-              ? `群聊 · ${c.members.length} 个成员`
-              : `单聊 · ${c.members[0]?.name ?? ''}`;
+              ? `群聊 · ${visibleMembers.length} 个成员`
+              : `单聊 · ${primaryMember?.name ?? ''}`;
             return (
               <li key={c.id} className="group">
                 <div
@@ -98,8 +100,8 @@ export function Sidebar() {
                       className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-[10px]"
                       style={{
                         background:
-                          (c.members[0]?.avatarColor ?? '#6366f1') + (isActive ? '' : '33'),
-                        color: isActive ? '#fff' : c.members[0]?.avatarColor ?? '#6366f1',
+                          (primaryMember?.avatarColor ?? '#6366f1') + (isActive ? '' : '33'),
+                        color: isActive ? '#fff' : primaryMember?.avatarColor ?? '#6366f1',
                       }}
                     >
                       <Users className="h-3 w-3" />
@@ -107,9 +109,9 @@ export function Sidebar() {
                   ) : (
                     <div className="mt-0.5">
                       <AgentAvatar
-                        name={c.members[0]?.name ?? c.title}
-                        adapterId={c.members[0]?.adapterId ?? ''}
-                        color={c.members[0]?.avatarColor ?? '#6366f1'}
+                        name={primaryMember?.name ?? c.title}
+                        adapterId={primaryMember?.adapterId ?? ''}
+                        color={primaryMember?.avatarColor ?? '#6366f1'}
                         size={20}
                       />
                     </div>

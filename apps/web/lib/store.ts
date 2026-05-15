@@ -32,6 +32,12 @@ export interface AgentProfile {
   ownerUserId: string | null;
 }
 
+export const HIDDEN_SYSTEM_AGENT_IDS = new Set(['mock', 'orchestrator']);
+
+export function isHiddenSystemAgentId(id: string): boolean {
+  return HIDDEN_SYSTEM_AGENT_IDS.has(id);
+}
+
 export interface ChatConversation {
   id: string;
   title: string;
@@ -371,12 +377,19 @@ export const useConversationStore = create<State>((set, get) => ({
     const found = new Set<string>();
     for (const m of text.matchAll(/@([\w-]+)/g)) {
       const id = m[1];
-      if (id && memberIds.has(id)) found.add(id);
+      if (id && (id === 'orchestrator' || memberIds.has(id))) found.add(id);
     }
+    const fallbackMember = conv?.members.find((m) => !isHiddenSystemAgentId(m.agentId)) ?? conv?.members[0];
+    const defaultSingleAgent =
+      conv?.targetAgentId && !isHiddenSystemAgentId(conv.targetAgentId)
+        ? conv.targetAgentId
+        : fallbackMember?.agentId;
     const mentions =
       found.size > 0
         ? [...found]
-        : [conv?.targetAgentId ?? conv?.members[0]?.agentId ?? 'deepseek-v3'];
+        : conv?.type === 'group'
+          ? ['orchestrator']
+          : [defaultSingleAgent ?? 'deepseek-v3'];
     get().ws!.send({
       op: 'user_msg',
       conversationId,
