@@ -12,8 +12,8 @@ import { DeepSeekAdapter } from '@agenthub/adapter-deepseek';
 import { DoubaoAdapter } from '@agenthub/adapter-doubao';
 import { TracingService } from '../observability/tracing.service.js';
 import { withLangfuse } from '../observability/adapter-tracing.js';
-
-const ADAPTER_REGISTRY = 'ADAPTER_REGISTRY';
+import { AdapterFactoryService } from './adapter.factory.js';
+import { ADAPTER_REGISTRY } from './constants.js';
 
 @Global()
 @Module({
@@ -73,8 +73,9 @@ const ADAPTER_REGISTRY = 'ADAPTER_REGISTRY';
         return registry;
       },
     },
+    AdapterFactoryService,
   ],
-  exports: [ADAPTER_REGISTRY],
+  exports: [ADAPTER_REGISTRY, AdapterFactoryService],
 })
 export class AdapterModule {}
 

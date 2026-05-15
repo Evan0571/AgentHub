@@ -9,6 +9,8 @@ export interface ChatMessage {
   conversationId: string;
   senderName: string;
   senderType: 'user' | 'agent' | 'system';
+  /** Underlying provider (e.g. `deepseek-v3`, `codex`) — drives the brand logo avatar. */
+  adapterId?: string;
   avatarColor?: string;
   text: string;
   thinking?: string;
@@ -16,14 +18,35 @@ export interface ChatMessage {
   createdAt: string;
 }
 
+export interface AgentProfile {
+  id: string;
+  name: string;
+  adapterId: string;
+  model: string | null;
+  baseUrl: string | null;
+  /** Server never returns the raw key; only whether one is stored. */
+  hasApiKey: boolean;
+  systemPrompt: string;
+  avatarColor: string;
+  isPublic: boolean;
+  ownerUserId: string | null;
+}
+
 export interface ChatConversation {
   id: string;
   title: string;
   type: 'single' | 'group';
-  /** For single chats: which agent to invoke by default. */
+  groupSystemPrompt?: string | null;
+  members: {
+    agentId: string;
+    name: string;
+    adapterId: string;
+    avatarColor: string;
+    role: 'admin' | 'member' | 'muted';
+  }[];
+  /** For single chats: which member to invoke by default. */
   targetAgentId?: string;
-  members: { id: string; name: string; color: string }[];
-  preview: string;
+  preview?: string;
 }
 
 export type RightPanelTab = 'workspace' | 'plan' | 'preview' | 'deploy';
@@ -40,6 +63,7 @@ export interface Deployment {
 
 interface State {
   conversations: ChatConversation[];
+  agents: AgentProfile[];
   activeId: string | null;
   messagesByConv: Record<string, ChatMessage[]>;
   plansByConv: Record<string, Plan>;
@@ -72,6 +96,45 @@ interface State {
   }) => void;
   /** Pull persisted messages + plan from server for a conversation. */
   hydrate: (conversationId: string) => Promise<void>;
+
+  // ----- conversation / member / agent management ---------------------
+  refreshAgents: () => Promise<void>;
+  refreshConversations: () => Promise<void>;
+  createConversation: (input: {
+    type: 'single' | 'group';
+    title: string;
+    memberAgentIds: string[];
+    groupSystemPrompt?: string | null;
+  }) => Promise<ChatConversation>;
+  deleteConversation: (id: string) => Promise<void>;
+  updateConversation: (
+    id: string,
+    patch: { title?: string; groupSystemPrompt?: string | null },
+  ) => Promise<void>;
+  addMember: (conversationId: string, agentId: string) => Promise<void>;
+  removeMember: (conversationId: string, agentId: string) => Promise<void>;
+  createAgent: (input: {
+    name: string;
+    adapterId: string;
+    systemPrompt: string;
+    avatarColor: string;
+    model?: string | null;
+    apiKey?: string | null;
+    baseUrl?: string | null;
+  }) => Promise<AgentProfile>;
+  updateAgent: (
+    id: string,
+    patch: Partial<{
+      name: string;
+      systemPrompt: string;
+      avatarColor: string;
+      model: string | null;
+      apiKey: string | null;
+      baseUrl: string | null;
+    }>,
+  ) => Promise<void>;
+  deleteAgent: (id: string) => Promise<void>;
+
   /** Transient banner message (e.g. plan_conflict). null when none. */
   banner: { kind: 'info' | 'warn' | 'error'; text: string } | null;
   dismissBanner: () => void;
@@ -94,18 +157,26 @@ function apiUrl(path: string): string {
 const hydratedConvs = new Set<string>();
 const hydratingConvs = new Set<string>();
 
-const AGENT_PROFILE: Record<
-  string,
-  { name: string; color: string }
-> = {
-  'deepseek-v3': { name: 'DeepSeek V3', color: '#4f46e5' },
-  'deepseek-r1': { name: 'DeepSeek R1', color: '#7c3aed' },
-  'claude-code': { name: 'Claude Code', color: '#d97706' },
-  codex: { name: 'Codex (GPT-4o)', color: '#10b981' },
-  doubao: { name: '豆包', color: '#ef4444' },
-  mock: { name: 'Mock', color: '#6b7280' },
-  orchestrator: { name: 'Orchestrator', color: '#f97316' },
+/**
+ * Last-resort fallback when an agent appears in a message before the agents
+ * list has loaded. Real agent profiles come from the server (DB) via
+ * `refreshAgents`. We also retain 'system' as a synthetic profile here so
+ * persisted system messages render with a neutral avatar.
+ */
+const AGENT_PROFILE_FALLBACK: Record<string, { name: string; color: string; adapterId?: string }> = {
+  system: { name: 'System', color: '#6b7280' },
+  me: { name: '我', color: '#6366f1' },
+  orchestrator: { name: 'Orchestrator', color: '#f97316', adapterId: 'orchestrator' },
 };
+
+function lookupAgentProfile(
+  senderId: string,
+  agents: AgentProfile[],
+): { name: string; color: string; adapterId?: string } {
+  const a = agents.find((x) => x.id === senderId);
+  if (a) return { name: a.name, color: a.avatarColor, adapterId: a.adapterId };
+  return AGENT_PROFILE_FALLBACK[senderId] ?? { name: senderId, color: '#9ca3af' };
+}
 
 // Stable seed timestamp — using a fixed string avoids `new Date()` running
 // at different moments on server vs client (which broke hydration before).
@@ -120,40 +191,41 @@ const SEED_TS = '2026-05-12T10:00:00.000Z';
 export const EMPTY_MESSAGES: readonly ChatMessage[] = Object.freeze([]);
 export const EMPTY_DEPLOYMENTS: readonly Deployment[] = Object.freeze([]);
 
-const seedConvs: ChatConversation[] = [
-  {
-    id: 'c1',
-    title: '我 + DeepSeek V3',
-    type: 'single',
-    targetAgentId: 'deepseek-v3',
-    members: [{ id: 'deepseek-v3', name: 'DeepSeek V3', color: '#4f46e5' }],
-    preview: '通用对话 / 写代码（快）',
-  },
-  {
-    id: 'c3',
-    title: '我 + DeepSeek R1（带思考链）',
-    type: 'single',
-    targetAgentId: 'deepseek-r1',
-    members: [{ id: 'deepseek-r1', name: 'DeepSeek R1', color: '#7c3aed' }],
-    preview: '复杂推理 / 规划（带思考过程）',
-  },
-  {
-    id: 'c2',
-    title: '待办应用工程群',
-    type: 'group',
-    members: [
-      { id: 'orchestrator', name: 'Orchestrator', color: '#f97316' },
-      { id: 'deepseek-r1', name: 'DeepSeek R1', color: '#7c3aed' },
-      { id: 'deepseek-v3', name: 'DeepSeek V3', color: '#4f46e5' },
-      { id: 'codex', name: 'Codex (GPT-4o)', color: '#10b981' },
-    ],
-    preview: '@orchestrator 一句话需求 → Plan → 多 Agent 并行…',
-  },
-];
+/**
+ * Map a ConversationSummary from the server into our store shape. Picks a
+ * sensible targetAgentId for single chats (the only non-orchestrator member).
+ */
+function fromServerConv(c: {
+  id: string;
+  type: 'single' | 'group';
+  title: string;
+  groupSystemPrompt: string | null;
+  members: Array<{
+    agentId: string;
+    name: string;
+    adapterId: string;
+    avatarColor: string;
+    role: 'admin' | 'member' | 'muted';
+  }>;
+}): ChatConversation {
+  const targetAgentId =
+    c.type === 'single'
+      ? c.members.find((m) => m.agentId !== 'orchestrator')?.agentId
+      : undefined;
+  return {
+    id: c.id,
+    title: c.title,
+    type: c.type,
+    groupSystemPrompt: c.groupSystemPrompt,
+    members: c.members,
+    targetAgentId,
+  };
+}
 
 export const useConversationStore = create<State>((set, get) => ({
-  conversations: seedConvs,
-  activeId: 'c1',
+  conversations: [],
+  agents: [],
+  activeId: null,
   plansByConv: {},
   deploymentsByConv: {},
   rightPanelTab: 'workspace',
@@ -232,16 +304,18 @@ export const useConversationStore = create<State>((set, get) => ({
         }>;
         plan: Plan | null;
       };
+      const agents = get().agents;
       const msgs: ChatMessage[] = data.messages.map((m) => {
         const profile =
           m.senderType === 'user'
-            ? { name: '我', color: '#6366f1' }
-            : AGENT_PROFILE[m.senderId] ?? { name: m.senderId, color: '#9ca3af' };
+            ? { name: '我', color: '#6366f1', adapterId: undefined as string | undefined }
+            : lookupAgentProfile(m.senderId, agents);
         return {
           id: m.id,
           conversationId: id,
           senderType: m.senderType,
           senderName: profile.name,
+          adapterId: profile.adapterId,
           avatarColor: profile.color,
           text: m.text,
           createdAt: m.createdAt,
@@ -293,7 +367,7 @@ export const useConversationStore = create<State>((set, get) => ({
     }));
     // Pull @agent-id mentions from the text and intersect with conversation members.
     // Fall back to the conversation's default target (single-chat) or first member.
-    const memberIds = new Set(conv?.members.map((m) => m.id) ?? []);
+    const memberIds = new Set(conv?.members.map((m) => m.agentId) ?? []);
     const found = new Set<string>();
     for (const m of text.matchAll(/@([\w-]+)/g)) {
       const id = m[1];
@@ -302,13 +376,146 @@ export const useConversationStore = create<State>((set, get) => ({
     const mentions =
       found.size > 0
         ? [...found]
-        : [conv?.targetAgentId ?? conv?.members[0]?.id ?? 'deepseek-v3'];
+        : [conv?.targetAgentId ?? conv?.members[0]?.agentId ?? 'deepseek-v3'];
     get().ws!.send({
       op: 'user_msg',
       conversationId,
       content: { kind: 'text', text },
       mentions,
     });
+  },
+
+  // ----- conversation / member / agent management ---------------------
+
+  refreshAgents: async () => {
+    try {
+      const r = await fetch(apiUrl('/api/agents'));
+      if (!r.ok) throw new Error(`agents ${r.status}`);
+      const data = (await r.json()) as AgentProfile[];
+      set(() => ({ agents: data }));
+    } catch (e) {
+      console.warn('[refreshAgents]', e);
+    }
+  },
+
+  refreshConversations: async () => {
+    try {
+      const r = await fetch(apiUrl('/api/conversations'));
+      if (!r.ok) throw new Error(`conversations ${r.status}`);
+      const data = (await r.json()) as Array<Parameters<typeof fromServerConv>[0]>;
+      const convs = data.map(fromServerConv);
+      set((s) => ({
+        conversations: convs,
+        // Pick first conv as active if none yet.
+        activeId: s.activeId ?? convs[0]?.id ?? null,
+      }));
+      const act = get().activeId;
+      if (act) void get().hydrate(act);
+    } catch (e) {
+      console.warn('[refreshConversations]', e);
+    }
+  },
+
+  createConversation: async (input) => {
+    const r = await fetch(apiUrl('/api/conversations'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) throw new Error(`create conv ${r.status}: ${await r.text()}`);
+    const data = (await r.json()) as Parameters<typeof fromServerConv>[0];
+    const conv = fromServerConv(data);
+    set((s) => ({
+      conversations: [conv, ...s.conversations],
+      activeId: conv.id,
+    }));
+    hydratedConvs.delete(conv.id);
+    void get().hydrate(conv.id);
+    return conv;
+  },
+
+  deleteConversation: async (id) => {
+    const r = await fetch(apiUrl(`/api/conversations/${id}`), { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) throw new Error(`delete conv ${r.status}`);
+    set((s) => {
+      const next = s.conversations.filter((c) => c.id !== id);
+      return {
+        conversations: next,
+        activeId: s.activeId === id ? next[0]?.id ?? null : s.activeId,
+      };
+    });
+  },
+
+  updateConversation: async (id, patch) => {
+    const r = await fetch(apiUrl(`/api/conversations/${id}`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error(`update conv ${r.status}: ${await r.text()}`);
+    const data = (await r.json()) as Parameters<typeof fromServerConv>[0];
+    const updated = fromServerConv(data);
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === id ? updated : c)),
+    }));
+  },
+
+  addMember: async (conversationId, agentId) => {
+    const r = await fetch(apiUrl(`/api/conversations/${conversationId}/members`), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId }),
+    });
+    if (!r.ok) throw new Error(`add member ${r.status}`);
+    const data = (await r.json()) as Parameters<typeof fromServerConv>[0];
+    const updated = fromServerConv(data);
+    set((s) => ({
+      conversations: s.conversations.map((c) => (c.id === conversationId ? updated : c)),
+    }));
+  },
+
+  removeMember: async (conversationId, agentId) => {
+    const r = await fetch(
+      apiUrl(`/api/conversations/${conversationId}/members/${agentId}`),
+      { method: 'DELETE' },
+    );
+    if (!r.ok && r.status !== 204) throw new Error(`remove member ${r.status}`);
+    set((s) => ({
+      conversations: s.conversations.map((c) =>
+        c.id === conversationId
+          ? { ...c, members: c.members.filter((m) => m.agentId !== agentId) }
+          : c,
+      ),
+    }));
+  },
+
+  createAgent: async (input) => {
+    const r = await fetch(apiUrl('/api/agents'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (!r.ok) throw new Error(`create agent ${r.status}: ${await r.text()}`);
+    const a = (await r.json()) as AgentProfile;
+    set((s) => ({ agents: [a, ...s.agents] }));
+    return a;
+  },
+
+  updateAgent: async (id, patch) => {
+    const r = await fetch(apiUrl(`/api/agents/${id}`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (!r.ok) throw new Error(`update agent ${r.status}`);
+    const a = (await r.json()) as AgentProfile;
+    set((s) => ({ agents: s.agents.map((x) => (x.id === id ? a : x)) }));
+  },
+
+  deleteAgent: async (id) => {
+    const r = await fetch(apiUrl(`/api/agents/${id}`), { method: 'DELETE' });
+    if (!r.ok && r.status !== 204) throw new Error(`delete agent ${r.status}`);
+    set((s) => ({ agents: s.agents.filter((x) => x.id !== id) }));
   },
 }));
 
@@ -382,12 +589,13 @@ function handleServerEvent(
   switch (ev.op) {
     case 'msg_started': {
       const senderId = ev.message.senderId;
-      const profile = AGENT_PROFILE[senderId] ?? { name: senderId, color: '#9ca3af' };
+      const profile = lookupAgentProfile(senderId, get().agents);
       const msg: ChatMessage = {
         id: ev.message.id,
         conversationId: ev.message.conversationId,
         senderType: ev.message.senderType,
         senderName: profile.name,
+        adapterId: profile.adapterId,
         avatarColor: profile.color,
         text: '',
         thinking: '',

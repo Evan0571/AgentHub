@@ -45,9 +45,8 @@ export class OrchestratorService {
     input: { conversationId: string; rootGoal: string },
     send: (e: ServerEvent) => void,
   ): Promise<Plan> {
-    // Surface "planning" feedback in the chat so the user has something to look at
-    // while the LLM is composing the DAG.
     const planningMsgId = cryptoRandomId();
+    const intro = `🧭 正在拆解目标：\n\n> ${input.rootGoal}\n\n_调用 Planner 模型中…_`;
     send({
       op: 'msg_started',
       message: {
@@ -58,32 +57,52 @@ export class OrchestratorService {
         createdAt: new Date().toISOString(),
       },
     });
-    send({
-      op: 'msg_token',
-      msgId: planningMsgId,
-      delta: `🧭 **Orchestrator** 正在为目标拆解任务：\n> ${input.rootGoal}\n`,
-    });
+    send({ op: 'msg_token', msgId: planningMsgId, delta: intro });
 
-    const plan = await this.planner.draft(input);
+    // Hard timeout — if the planner LLM hangs, don't leave the chat stuck on
+    // "正在拆解…" forever. 60s is generous for DeepSeek V3 streaming.
+    let plan: Plan;
+    try {
+      plan = await Promise.race([
+        this.planner.draft(input),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('planner timeout (60s)')), 60_000),
+        ),
+      ]);
+    } catch (e) {
+      const errMsg = (e as Error).message;
+      console.error('[orchestrator] planner failed:', errMsg);
+      const failText = `\n\n❌ Plan 拆解失败：${errMsg}\n\n请重试，或检查 server 控制台日志。`;
+      send({ op: 'msg_token', msgId: planningMsgId, delta: failText });
+      send({ op: 'msg_done', msgId: planningMsgId });
+      void this.messages
+        .insert({
+          conversationSlug: input.conversationId,
+          senderType: 'system',
+          senderId: 'orchestrator',
+          text: intro + failText,
+        })
+        .catch(() => undefined);
+      throw e;
+    }
+
     await this.plans.save(plan);
 
-    const summary = `\n已生成 **${plan.tasks.length}** 个子任务（见右侧 Plan 面板）。开始并发执行 →`;
+    const summary = `\n\n✅ 已生成 **${plan.tasks.length}** 个子任务（见右侧 Plan 面板）。开始并发执行 →`;
     send({ op: 'msg_token', msgId: planningMsgId, delta: summary });
     send({ op: 'msg_done', msgId: planningMsgId });
 
-    // Persist the complete orchestrator system message.
     void this.messages
       .insert({
         conversationSlug: input.conversationId,
         senderType: 'system',
         senderId: 'orchestrator',
-        text:
-          `🧭 **Orchestrator** 正在为目标拆解任务：\n> ${input.rootGoal}\n` + summary,
+        text: intro + summary,
       })
       .catch(() => undefined);
 
     send({ op: 'plan_update', plan });
-    void this.executor.run(plan, send); // fire-and-forget; updates streamed
+    void this.executor.run(plan, send);
     return plan;
   }
 

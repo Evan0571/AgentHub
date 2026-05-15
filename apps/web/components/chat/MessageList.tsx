@@ -5,6 +5,7 @@ import { ChevronDown, ChevronRight, Sparkles } from 'lucide-react';
 import { useConversationStore, type ChatMessage, EMPTY_MESSAGES } from '@/lib/store';
 import { Markdown } from './Markdown';
 import { MentionText } from './MentionText';
+import { AgentAvatar } from '../AgentAvatar';
 
 export function MessageList({ conversationId }: { conversationId: string }) {
   const messages = useConversationStore(
@@ -36,16 +37,15 @@ const MessageRow = memo(MessageRowImpl, (prev, next) => prev.m === next.m);
 
 function MessageRowImpl({ m }: { m: ChatMessage }) {
   const isUser = m.senderType === 'user';
-  const isSystem = m.senderType === 'system';
 
   return (
     <div className="flex gap-3">
-      <div
-        className="h-8 w-8 shrink-0 rounded font-semibold flex items-center justify-center text-xs"
-        style={{ background: m.avatarColor ?? '#6366f1' }}
-      >
-        {m.senderName[0]}
-      </div>
+      <AgentAvatar
+        name={m.senderName}
+        adapterId={m.adapterId ?? ''}
+        color={m.avatarColor ?? '#6366f1'}
+        size={32}
+      />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
           <span className="text-sm font-medium">{m.senderName}</span>
@@ -59,9 +59,13 @@ function MessageRowImpl({ m }: { m: ChatMessage }) {
         ) : null}
 
         {m.text ? (
-          isUser || isSystem ? (
+          isUser ? (
+            // User-typed text never gets markdown processing — show as-is with
+            // @mention chip rendering.
             <MentionText text={m.text} conversationId={m.conversationId} />
           ) : (
+            // Both agent and system messages render through Markdown (so the
+            // orchestrator's **bold** / > blockquote / lists actually render).
             <Markdown text={m.text} messageId={m.id} />
           )
         ) : m.streaming && !m.thinking ? (

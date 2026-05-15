@@ -6,6 +6,7 @@ import { MessageList } from './MessageList';
 import { useConversationStore } from '@/lib/store';
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
 import { Banner } from '../Banner';
+import { MembersPanel } from './MembersPanel';
 
 interface MentionState {
   /** Index of the '@' that opened the picker. */
@@ -22,6 +23,7 @@ export function ChatPane() {
   const hydrate = useConversationStore((s) => s.hydrate);
   const [text, setText] = useState('');
   const [mention, setMention] = useState<MentionState | null>(null);
+  const [showMembers, setShowMembers] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -43,10 +45,10 @@ export function ChatPane() {
   const candidates: MentionCandidate[] = useMemo(() => {
     if (!active) return [];
     return active.members.map((m) => ({
-      id: m.id,
+      id: m.agentId,
       name: m.name,
-      color: m.color,
-      hint: describe(m.id),
+      color: m.avatarColor,
+      hint: describe(m.adapterId),
     }));
   }, [active]);
 
@@ -134,7 +136,11 @@ export function ChatPane() {
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-bg">
       <Banner />
-      <header className="flex items-center gap-3 border-b border-white/5 px-5 py-3">
+      <header
+        onClick={() => setShowMembers(true)}
+        className="flex cursor-pointer items-center gap-3 border-b border-white/5 px-5 py-3 hover:bg-white/[0.02]"
+        title="点击查看 / 管理成员"
+      >
         <div className="flex h-8 w-8 items-center justify-center rounded bg-accent/20 text-accent font-semibold">
           {active.title[0]}
         </div>
@@ -205,9 +211,13 @@ export function ChatPane() {
         <div className="mt-1 px-1 text-[10px] text-text-muted/70">
           {active.type === 'group'
             ? `成员：${active.members.map((m) => m.name).join('，')}`
-            : `本会话默认 @${active.targetAgentId ?? active.members[0]?.id ?? ''}`}
+            : `本会话默认 @${active.targetAgentId ?? active.members[0]?.agentId ?? ''}`}
         </div>
       </footer>
+
+      {showMembers ? (
+        <MembersPanel conversation={active} onClose={() => setShowMembers(false)} />
+      ) : null}
     </main>
   );
 }

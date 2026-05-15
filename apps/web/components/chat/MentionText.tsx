@@ -20,7 +20,7 @@ export function MentionText({
 
   const memberMap = useMemo(() => {
     const map = new Map<string, { name: string; color: string }>();
-    for (const m of members ?? []) map.set(m.id, { name: m.name, color: m.color });
+    for (const m of members ?? []) map.set(m.agentId, { name: m.name, color: m.avatarColor });
     return map;
   }, [members]);
 

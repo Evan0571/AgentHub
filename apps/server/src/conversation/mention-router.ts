@@ -2,9 +2,19 @@ import { Inject, Injectable } from '@nestjs/common';
 import type { AgentAdapter, AdapterRegistry, ChatRequest } from '@agenthub/adapter-core';
 import type { ClientEvent, ServerEvent } from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
+import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import type { OrchestratorService } from '../orchestrator/orchestrator.service.js';
 import { MessagesRepo } from '../db/messages.repo.js';
+import { AgentsRepo } from '../db/agents.repo.js';
+import { ConversationsRepo } from '../db/conversations.repo.js';
 import { TracingService } from '../observability/tracing.service.js';
+
+interface ResolvedAgent {
+  agentId: string;          // the canonical agent id (UUID or built-in slug)
+  adapterId: string;        // which adapter backs this agent
+  name: string;             // display name shown in peer-aware prompt
+  systemPrompt: string;     // custom role / system prompt on the agent itself
+}
 
 /**
  * @ routing protocol (PRD §5.3):
@@ -41,6 +51,9 @@ export class MentionRouter {
     @Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry,
     private readonly messages: MessagesRepo,
     private readonly tracing: TracingService,
+    private readonly agentsRepo: AgentsRepo,
+    private readonly convsRepo: ConversationsRepo,
+    private readonly adapterFactory: AdapterFactoryService,
   ) {}
 
   async route(
@@ -78,18 +91,23 @@ export class MentionRouter {
     event: Extract<ClientEvent, { op: 'user_msg' }>,
     send: (e: ServerEvent) => void,
   ): Promise<void> {
+    // Resolve every mention into a real agent (with its system prompt + which
+    // adapter to call). Agents are now first-class DB rows — built-ins seeded
+    // with empty system prompt, custom ones have user-defined roles.
+    const resolved = await Promise.all(event.mentions.map((m) => this.resolveAgent(m)));
+    const peers = resolved.filter((r): r is ResolvedAgent => r !== null);
 
-    // Resolve every mention to its concrete adapter id so each agent knows
-    // *who else* the user is asking in parallel. Without this, agents
-    // receive the same prompt independently and each tries to cover all
-    // requested styles (e.g. "@A @B 各写一个 X" → A writes both styles, B
-    // also writes both styles).
-    const peerAdapterIds = event.mentions.map((m) => this.resolveAdapter(m));
+    // Conversation-level system prompt ("group rules"), if any.
+    const realConvId = this.messages.resolveConversationUuid(event.conversationId);
+    const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
+    const groupRules = conv?.groupSystemPrompt ?? null;
+
     await Promise.all(
-      peerAdapterIds.map((adapterId) =>
+      peers.map((self) =>
         this.invokeAgent({
-          adapterId,
-          peerAdapterIds,
+          self,
+          peers,
+          groupRules,
           conversationId: event.conversationId,
           userText: event.content.kind === 'text' ? event.content.text : '',
           hop: 0,
@@ -99,46 +117,78 @@ export class MentionRouter {
     );
   }
 
+  /** Look up an agent row → fall back to adapter-id-as-agent for legacy callers. */
+  private async resolveAgent(mention: string): Promise<ResolvedAgent | null> {
+    const a = await this.agentsRepo.getById(mention);
+    if (a) {
+      const adapterId =
+        this.registry.has(a.adapterId) ? a.adapterId : this.fallbackAdapter();
+      return {
+        agentId: a.id,
+        adapterId,
+        name: a.name,
+        systemPrompt: a.systemPrompt ?? '',
+      };
+    }
+    // Legacy: caller passed an adapter id directly (e.g. 'deepseek-v3') and
+    // somehow it isn't in the DB. Use a synthesized profile.
+    const adapterId = this.registry.has(mention) ? mention : this.fallbackAdapter();
+    return {
+      agentId: mention,
+      adapterId,
+      name: mention,
+      systemPrompt: '',
+    };
+  }
+
+  private fallbackAdapter(): string {
+    const preference = ['deepseek-v3', 'claude-code', 'codex', 'doubao', 'mock'];
+    for (const id of preference) if (this.registry.has(id)) return id;
+    return 'mock';
+  }
+
   /**
    * Build a per-invocation system prompt. When the user @-mentioned multiple
    * agents in this turn, append a section telling each agent who its peers
    * are and that it should only produce ITS share — not try to cover all
    * styles itself.
    */
-  private buildSystemPrompt(selfId: string, peerAdapterIds: string[]): string {
-    const peers = peerAdapterIds.filter((id) => id !== selfId);
-    if (peers.length === 0) return DEFAULT_SYSTEM_PROMPT;
-
-    const nameOf = (id: string) => (this.registry.has(id) ? this.registry.get(id).displayName : id);
-    const selfName = nameOf(selfId);
-    const peerNames = peers.map(nameOf).join('、');
-
-    return (
-      DEFAULT_SYSTEM_PROMPT +
-      `\n\n## 多 Agent 协作上下文\n\n` +
-      `**用户的同一条消息也同时发给了**：${peerNames}。\n` +
-      `**你的身份**：${selfName}。\n\n` +
-      `重要约束：\n` +
-      `- 你只产出**你自己的那一份**回复，不要替别人写，不要列出他们的版本，不要做横向对比。\n` +
-      `- 用户说"各写一个 X / 各自实现 / 各用自己风格"时，你**只写一个 X**（属于你的那个）。不要列"风格 1 / 风格 2"。\n` +
-      `- 用户说"对比 / diff" 时，你只发表你的看法，让别的 Agent 自己说他们的。\n` +
-      `- 即使其他 Agent 还没回复，也不要替他们设想或代笔。`
-    );
-  }
-
-  private resolveAdapter(agentId: string): string {
-    // 1. If the mention matches a registered adapter id, use it directly.
-    if (this.registry.has(agentId)) return agentId;
-    // 2. Otherwise fall back to preference list.
-    const preference = ['deepseek-v3', 'claude-code', 'codex', 'doubao', 'mock'];
-    for (const id of preference) if (this.registry.has(id)) return id;
-    return 'mock';
+  /**
+   * Compose the final system prompt for one agent's invocation:
+   *   1. DEFAULT (output conventions)
+   *   2. Conversation-level "group rules" (if set)
+   *   3. The agent's own role / system prompt
+   *   4. Peer-awareness block ("you are X, peers are Y; only do your share")
+   */
+  private buildSystemPrompt(self: ResolvedAgent, peers: ResolvedAgent[], groupRules: string | null): string {
+    const blocks: string[] = [DEFAULT_SYSTEM_PROMPT];
+    if (groupRules && groupRules.trim()) {
+      blocks.push(`## 群规则\n\n${groupRules.trim()}`);
+    }
+    if (self.systemPrompt && self.systemPrompt.trim()) {
+      blocks.push(`## 你的角色：${self.name}\n\n${self.systemPrompt.trim()}`);
+    }
+    const others = peers.filter((p) => p.agentId !== self.agentId);
+    if (others.length > 0) {
+      const peerNames = others.map((p) => p.name).join('、');
+      blocks.push(
+        `## 多 Agent 协作上下文\n\n` +
+          `**用户的同一条消息也同时发给了**：${peerNames}。\n` +
+          `**你的身份**：${self.name}。\n\n` +
+          `重要约束：\n` +
+          `- 你只产出**你自己的那一份**回复，不要替别人写，不要列出他们的版本，不要做横向对比。\n` +
+          `- 用户说"各写一个 X / 各自实现 / 各用自己风格"时，你**只写一个 X**（属于你的那个）。不要列"风格 1 / 风格 2"。\n` +
+          `- 用户说"对比 / diff" 时，你只发表你的看法，让别的 Agent 自己说他们的。\n` +
+          `- 即使其他 Agent 还没回复，也不要替他们设想或代笔。`,
+      );
+    }
+    return blocks.join('\n\n');
   }
 
   private async invokeAgent(args: {
-    adapterId: string;
-    /** All adapters the user @-mentioned in this turn (includes self). */
-    peerAdapterIds: string[];
+    self: ResolvedAgent;
+    peers: ResolvedAgent[];
+    groupRules: string | null;
     conversationId: string;
     userText: string;
     hop: number;
@@ -154,13 +204,28 @@ export class MentionRouter {
       return;
     }
 
-    const adapter: AgentAdapter = this.registry.get(args.adapterId);
+    // Resolve via factory so BYOK / per-agent model / custom baseUrl all
+    // funnel through one place. Reads the (decrypted) agent secrets only
+    // here — they never leave the server.
+    const full = await this.agentsRepo.getByIdWithSecrets(args.self.agentId);
+    const adapter: AgentAdapter = this.adapterFactory.resolveForAgent({
+      agentId: args.self.agentId,
+      adapterId: args.self.adapterId,
+      model: full?.model ?? null,
+      apiKey: full?.apiKey ?? null,
+      baseUrl: full?.baseUrl ?? null,
+    });
     const msgId = cryptoRandomId();
     const req: ChatRequest = {
       taskId: msgId,
-      systemPrompt: this.buildSystemPrompt(args.adapterId, args.peerAdapterIds),
+      systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules),
       messages: [{ role: 'user', content: args.userText }],
-      metadata: { purpose: 'chat', agentId: args.adapterId },
+      metadata: {
+        purpose: 'chat',
+        agentId: args.self.agentId,
+        adapterId: args.self.adapterId,
+        agentName: args.self.name,
+      },
     };
 
     args.send({
@@ -169,7 +234,8 @@ export class MentionRouter {
         id: msgId,
         conversationId: args.conversationId,
         senderType: 'agent',
-        senderId: args.adapterId,
+        // We send the canonical agent id; the client maps it to display profile.
+        senderId: args.self.agentId,
         createdAt: new Date().toISOString(),
       },
     });
@@ -214,7 +280,7 @@ export class MentionRouter {
         .insert({
           conversationSlug: args.conversationId,
           senderType: 'agent',
-          senderId: args.adapterId,
+          senderId: args.self.agentId,
           text: assembled,
         })
         .catch((e) => console.warn('[mention-router] persist agent msg failed', e));

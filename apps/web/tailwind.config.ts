@@ -1,14 +1,30 @@
 import type { Config } from 'tailwindcss';
 
+/**
+ * All theme colors are driven by CSS variables defined in `globals.css`.
+ * `:root` (or `.dark`) carries the dark palette; `.light` overrides them.
+ * Using `rgb(var(--token) / <alpha-value>)` keeps Tailwind's `/<alpha>`
+ * opacity modifier (e.g. `bg-bg/60`) working in both modes.
+ */
 export default {
   darkMode: 'class',
   content: ['./app/**/*.{ts,tsx}', './components/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
-        bg: { DEFAULT: '#0b0d12', soft: '#11141a', panel: '#161a23' },
-        text: { DEFAULT: '#e7e9ee', muted: '#9aa3b2' },
-        accent: { DEFAULT: '#6366f1', hover: '#7c7ff5' },
+        bg: {
+          DEFAULT: 'rgb(var(--bg) / <alpha-value>)',
+          soft: 'rgb(var(--bg-soft) / <alpha-value>)',
+          panel: 'rgb(var(--bg-panel) / <alpha-value>)',
+        },
+        text: {
+          DEFAULT: 'rgb(var(--text) / <alpha-value>)',
+          muted: 'rgb(var(--text-muted) / <alpha-value>)',
+        },
+        accent: {
+          DEFAULT: 'rgb(var(--accent) / <alpha-value>)',
+          hover: 'rgb(var(--accent-hover) / <alpha-value>)',
+        },
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],

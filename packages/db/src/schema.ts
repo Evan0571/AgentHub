@@ -57,7 +57,10 @@ export const apiKeys = pgTable('api_keys', {
 });
 
 export const agents = pgTable('agents', {
-  id: uuid('id').primaryKey().defaultRandom(),
+  // text not uuid: built-in agents use stable slug ids ('deepseek-v3',
+  // 'orchestrator', ...) so they survive re-seeding meaningfully.
+  // Custom user agents still get crypto.randomUUID() at the application layer.
+  id: text('id').primaryKey(),
   ownerUserId: uuid('owner_user_id').references(() => users.id, { onDelete: 'set null' }),
   name: text('name').notNull(),
   adapterId: text('adapter_id').notNull(),
@@ -65,6 +68,14 @@ export const agents = pgTable('agents', {
   systemPrompt: text('system_prompt').notNull(),
   avatarColor: text('avatar_color').notNull().default('#6366f1'),
   isPublic: boolean('is_public').notNull().default(false),
+  // BYOK (bring-your-own-key): user-supplied API key for this agent's backing
+  // provider, AES-256-GCM ciphertext (see apps/server/src/crypto). Nullable
+  // — when null, the server uses its env-configured fallback key.
+  apiKeyEncrypted: text('api_key_encrypted'),
+  // Custom OpenAI-compatible endpoint base URL (Ollama, vLLM, OneAPI, Groq).
+  // Only meaningful when adapterId === 'openai-compatible' (or user wants
+  // to override an official provider's default endpoint).
+  baseUrl: text('base_url'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -86,7 +97,8 @@ export const conversationMembers = pgTable(
     conversationId: uuid('conversation_id')
       .notNull()
       .references(() => conversations.id, { onDelete: 'cascade' }),
-    agentId: uuid('agent_id')
+    // Matches agents.id (text).
+    agentId: text('agent_id')
       .notNull()
       .references(() => agents.id, { onDelete: 'cascade' }),
     role: memberRole('role').notNull().default('member'),
@@ -159,7 +171,7 @@ export const tasks = pgTable('tasks', {
     .references(() => plans.id, { onDelete: 'cascade' }),
   parentId: uuid('parent_id'),
   goal: text('goal').notNull(),
-  assigneeAgentId: uuid('assignee_agent_id').references(() => agents.id, {
+  assigneeAgentId: text('assignee_agent_id').references(() => agents.id, {
     onDelete: 'set null',
   }),
   status: taskStatus('status').notNull().default('pending'),

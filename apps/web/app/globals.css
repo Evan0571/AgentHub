@@ -2,8 +2,32 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* ------------------------------------------------------------- palette --
+ * Default (dark) palette. Same values as the previous hard-coded tokens.
+ * `.light` further down overrides them. RGB triplets (no commas) — required
+ * by Tailwind's `rgb(var(--x) / <alpha-value>)` modifier.
+ * --------------------------------------------------------------------- */
+:root,
+.dark {
+  --bg: 11 13 18;
+  --bg-soft: 17 20 26;
+  --bg-panel: 22 26 35;
+  --text: 231 233 238;
+  --text-muted: 154 163 178;
+  --accent: 99 102 241;
+  --accent-hover: 124 127 245;
   color-scheme: dark;
+}
+
+.light {
+  --bg: 255 255 255;
+  --bg-soft: 248 249 251;
+  --bg-panel: 241 242 245;
+  --text: 26 29 35;
+  --text-muted: 107 114 128;
+  --accent: 79 70 229;
+  --accent-hover: 67 56 202;
+  color-scheme: light;
 }
 
 html, body, #__next {
@@ -18,3 +42,23 @@ body {
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { @apply bg-text-muted/30 rounded; }
 ::-webkit-scrollbar-thumb:hover { @apply bg-text-muted/50; }
+
+/* -------------------------------------------------------------- overlays --
+ * The codebase uses `bg-white/X`, `border-white/X`, `hover:bg-white/X`
+ * for hover / border accents — that's invisible on a white background.
+ * In light mode we re-target those classes to a dark-with-alpha overlay
+ * so the existing components don't need 86 search-and-replace edits.
+ * --------------------------------------------------------------------- */
+.light .bg-white\/5 { background-color: rgb(15 23 42 / 0.04); }
+.light .bg-white\/10 { background-color: rgb(15 23 42 / 0.06); }
+.light .hover\:bg-white\/5:hover { background-color: rgb(15 23 42 / 0.04); }
+.light .hover\:bg-white\/10:hover { background-color: rgb(15 23 42 / 0.07); }
+.light .border-white\/5 { border-color: rgb(15 23 42 / 0.08); }
+.light .border-white\/10 { border-color: rgb(15 23 42 / 0.12); }
+.light .border-white\/20 { border-color: rgb(15 23 42 / 0.16); }
+.light .bg-white\/\[0\.02\] { background-color: rgb(15 23 42 / 0.025); }
+.light .hover\:bg-white\/\[0\.02\]:hover { background-color: rgb(15 23 42 / 0.025); }
+.light .text-white { color: rgb(15 23 42); }
+
+/* Modal scrim still wants a dim layer in both modes, but black/60 reads
+ * fine on a light page too — leave it. */
