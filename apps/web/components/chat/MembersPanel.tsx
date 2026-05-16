@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Loader2, Pencil, Plus, Trash2, UserMinus, X } from 'lucide-react';
 import clsx from 'clsx';
-import { isHiddenSystemAgentId, useConversationStore, type ChatConversation } from '@/lib/store';
+import { isConversationScopedAgentId, isHiddenSystemAgentId, useConversationStore, type ChatConversation } from '@/lib/store';
 import { ModalShell } from './NewConversationDialog';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
@@ -49,7 +49,7 @@ export function MembersPanel({
     [conversation.members],
   );
   const candidates = useMemo(
-    () => agents.filter((a) => !isHiddenSystemAgentId(a.id) && !memberIds.has(a.id)),
+    () => agents.filter((a) => !isHiddenSystemAgentId(a.id) && !isConversationScopedAgentId(a.id) && !memberIds.has(a.id)),
     [agents, memberIds],
   );
 

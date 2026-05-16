@@ -50,9 +50,9 @@ export function MentionText({
         return (
           <span
             key={i}
-            className="mx-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[12px] font-medium"
-            style={{ background: info.color + '22', color: info.color }}
+            className="mx-0.5 inline-flex items-center gap-1 rounded border border-white/10 bg-white/10 px-1.5 py-0.5 text-[12px] font-medium text-white/95"
           >
+            <span className="h-3 w-0.5 rounded-full" style={{ background: info.color }} />
             @{info.name}
           </span>
         );

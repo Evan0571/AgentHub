@@ -7,6 +7,7 @@ import { PlanService } from './plan.service.js';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { MessagesRepo } from '../db/messages.repo.js';
 import { TracingService } from '../observability/tracing.service.js';
+import { WorkspaceService } from '../workspace/workspace.service.js';
 
 /**
  * Public-facing orchestrator (PRD §5.5).
@@ -22,6 +23,7 @@ export class OrchestratorService {
     @Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry,
     private readonly messages: MessagesRepo,
     private readonly tracing: TracingService,
+    private readonly workspace: WorkspaceService,
   ) {}
 
   async plan(
@@ -54,14 +56,14 @@ export class OrchestratorService {
         id: planningMsgId,
         conversationId: input.conversationId,
         senderType: plannerAgent ? 'agent' : 'system',
-        senderId: plannerAgent?.agentId ?? 'orchestrator',
+        senderId: plannerAgent?.agentId ?? 'system',
         createdAt: new Date().toISOString(),
       },
     });
     send({ op: 'msg_token', msgId: planningMsgId, delta: intro });
 
     // Hard timeout — if the planner LLM hangs, don't leave the chat stuck on
-    // "正在拆解…" forever. 60s is generous for DeepSeek V3 streaming.
+    // "正在拆解…" forever. 60s is generous for DeepSeek streaming.
     let plan: Plan;
     try {
       plan = await Promise.race([
@@ -80,7 +82,7 @@ export class OrchestratorService {
         .insert({
           conversationSlug: input.conversationId,
           senderType: plannerAgent ? 'agent' : 'system',
-          senderId: plannerAgent?.agentId ?? 'orchestrator',
+          senderId: plannerAgent?.agentId ?? 'system',
           text: intro + failText,
         })
         .catch(() => undefined);
@@ -88,6 +90,10 @@ export class OrchestratorService {
     }
 
     await this.plans.save(plan);
+    await this.workspace.writeFile(input.conversationId, {
+      path: 'TASKS.md',
+      content: renderTasksMarkdown(plan, plannerAgent),
+    });
 
     const summary = `\n\n✅ 已生成 **${plan.tasks.length}** 个子任务（见右侧 Plan 面板）。开始并发执行 →`;
     send({ op: 'msg_token', msgId: planningMsgId, delta: summary });
@@ -97,7 +103,7 @@ export class OrchestratorService {
       .insert({
         conversationSlug: input.conversationId,
         senderType: plannerAgent ? 'agent' : 'system',
-        senderId: plannerAgent?.agentId ?? 'orchestrator',
+        senderId: plannerAgent?.agentId ?? 'system',
         text: intro + summary,
       })
       .catch(() => undefined);
@@ -177,11 +183,13 @@ export class OrchestratorService {
       return;
     }
 
-    const adapter = this.registry.has('deepseek-v3')
-      ? this.registry.get('deepseek-v3')
-      : this.registry.has('mock')
-        ? this.registry.get('mock')
-        : undefined;
+    const adapter = this.registry.has('deepseek-v4-flash')
+      ? this.registry.get('deepseek-v4-flash')
+      : this.registry.has('deepseek-v3')
+        ? this.registry.get('deepseek-v3')
+        : this.registry.has('mock')
+          ? this.registry.get('mock')
+          : undefined;
     if (!adapter) {
       send({
         op: 'dep_suggestion_error',
@@ -281,4 +289,58 @@ function extractJsonObject(text: string): { suggestedInputs?: unknown; reasoning
 
 function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function renderTasksMarkdown(
+  plan: Plan,
+  plannerAgent: { name: string; agentId: string } | null,
+): string {
+  const lines: string[] = [
+    `# ${plan.rootGoal}`,
+    '',
+    `> Planner: ${plannerAgent ? `${plannerAgent.name} (${plannerAgent.agentId})` : 'default planner'}`,
+    `> Plan ID: ${plan.id}`,
+    '',
+    '## 使用方式',
+    '',
+    '- 右侧 Plan 面板是执行用 DAG；这个文件是可编辑的项目任务说明。',
+    '- 如果你想改任务范围，先改这里，再在 Plan 面板同步增删/修改任务。',
+    '- 每个 Agent 执行任务时应优先参考本文件和 workspace 里的真实文件。',
+    '',
+    '## Root Goal',
+    '',
+    plan.rootGoal,
+    '',
+    '## Tasks',
+    '',
+  ];
+
+  for (const task of plan.tasks) {
+    lines.push(`### ${task.id}. ${task.goal}`);
+    lines.push('');
+    lines.push(`- Owner: ${task.assigneeAgentId ? `@${task.assigneeAgentId}` : 'unassigned'}`);
+    lines.push(`- Depends on: ${task.inputs.length > 0 ? task.inputs.join(', ') : 'none'}`);
+    lines.push(`- Acceptance: ${task.acceptance.map((a) => a.kind).join(', ') || 'manual'}`);
+    lines.push('');
+    if (task.details) {
+      lines.push('**Details**');
+      lines.push('');
+      lines.push(task.details);
+      lines.push('');
+    }
+    if (task.deliverables?.length) {
+      lines.push('**Deliverables**');
+      lines.push('');
+      for (const item of task.deliverables) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (task.checklist?.length) {
+      lines.push('**Checklist**');
+      lines.push('');
+      for (const item of task.checklist) lines.push(`- [ ] ${item}`);
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n');
 }

@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { eq, asc } from 'drizzle-orm';
 import { messages, conversations, type Db } from '@agenthub/db';
+import type { MessageAttachment } from '@agenthub/shared-types';
 import { DB_TOKEN, SLUG_TO_UUID, UUID_TO_SLUG } from './constants.js';
 
 export interface PersistedMessage {
@@ -9,6 +10,7 @@ export interface PersistedMessage {
   senderType: 'user' | 'agent' | 'system';
   senderId: string;
   text: string;
+  attachments?: MessageAttachment[];
   createdAt: string;
 }
 
@@ -36,6 +38,7 @@ export class MessagesRepo {
     senderType: 'user' | 'agent' | 'system';
     senderId: string;
     text: string;
+    attachments?: MessageAttachment[];
   }): Promise<void> {
     const convId = this.resolveConversationUuid(input.conversationSlug);
     if (!convId) return; // unknown conversation — skip silently
@@ -44,7 +47,11 @@ export class MessagesRepo {
       senderType: input.senderType,
       senderId: input.senderId,
       contentType: 'text',
-      body: { kind: 'text', text: input.text },
+      body: {
+        kind: 'text',
+        text: input.text,
+        ...(input.attachments?.length ? { attachments: input.attachments } : {}),
+      },
     });
   }
 
@@ -63,6 +70,7 @@ export class MessagesRepo {
       senderType: r.senderType as 'user' | 'agent' | 'system',
       senderId: r.senderId,
       text: extractText(r.body),
+      attachments: extractAttachments(r.body),
       createdAt: r.createdAt.toISOString(),
     }));
   }
@@ -74,4 +82,23 @@ function extractText(body: unknown): string {
     return typeof t === 'string' ? t : '';
   }
   return '';
+}
+
+function extractAttachments(body: unknown): MessageAttachment[] | undefined {
+  if (!body || typeof body !== 'object' || !('attachments' in (body as Record<string, unknown>))) return undefined;
+  const raw = (body as { attachments?: unknown }).attachments;
+  if (!Array.isArray(raw)) return undefined;
+  const attachments = raw.filter((item): item is MessageAttachment => {
+    if (!item || typeof item !== 'object') return false;
+    const row = item as Record<string, unknown>;
+    return (
+      typeof row.id === 'string' &&
+      typeof row.name === 'string' &&
+      typeof row.path === 'string' &&
+      typeof row.mimeType === 'string' &&
+      typeof row.size === 'number' &&
+      (row.kind === 'image' || row.kind === 'text' || row.kind === 'file')
+    );
+  });
+  return attachments.length > 0 ? attachments : undefined;
 }

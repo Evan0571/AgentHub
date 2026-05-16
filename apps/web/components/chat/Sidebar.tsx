@@ -8,7 +8,7 @@ import { ManageAgentsModal } from './ManageAgentsModal';
 import { ThemeToggle } from '../ThemeToggle';
 import { AgentAvatar } from '../AgentAvatar';
 
-export function Sidebar() {
+export function Sidebar({ className = 'w-72' }: { className?: string }) {
   const conversations = useConversationStore((s) => s.conversations);
   const activeId = useConversationStore((s) => s.activeId);
   const setActive = useConversationStore((s) => s.setActive);
@@ -38,7 +38,7 @@ export function Sidebar() {
   };
 
   return (
-    <aside className="flex w-72 flex-col border-r border-white/5 bg-bg-soft">
+    <aside className={`flex ${className} flex-col border-r border-white/5 bg-bg-soft`}>
       <header className="flex items-center gap-2 px-4 py-3 border-b border-white/5">
         <Sparkles className="h-5 w-5 text-accent" />
         <span className="font-semibold tracking-wide">AgentHub</span>
@@ -100,8 +100,8 @@ export function Sidebar() {
                       className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-[10px]"
                       style={{
                         background:
-                          (primaryMember?.avatarColor ?? '#6366f1') + (isActive ? '' : '33'),
-                        color: isActive ? '#fff' : primaryMember?.avatarColor ?? '#6366f1',
+                          (primaryMember?.avatarColor ?? '#0f766e') + (isActive ? '' : '33'),
+                        color: isActive ? '#fff' : primaryMember?.avatarColor ?? '#0f766e',
                       }}
                     >
                       <Users className="h-3 w-3" />
@@ -111,7 +111,7 @@ export function Sidebar() {
                       <AgentAvatar
                         name={primaryMember?.name ?? c.title}
                         adapterId={primaryMember?.adapterId ?? ''}
-                        color={primaryMember?.avatarColor ?? '#6366f1'}
+                        color={primaryMember?.avatarColor ?? '#0f766e'}
                         size={20}
                       />
                     </div>

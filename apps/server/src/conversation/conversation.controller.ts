@@ -31,6 +31,25 @@ const CreateConversationSchema = z.object({
   // Match the DB column: nullable + optional. Empty / null means "no group prompt".
   groupSystemPrompt: z.string().max(4000).nullable().optional(),
   memberAgentIds: z.array(z.string()).default([]),
+  memberConfigs: z
+    .array(
+      z.object({
+        roleAgentId: z.string().min(1).max(120),
+        adapterId: z.string().min(1).max(120),
+        model: z.string().max(160).nullable().optional(),
+        skills: z
+          .array(
+            z.object({
+              id: z.string().min(1).max(80),
+              label: z.string().min(1).max(80),
+              prompt: z.string().min(1).max(1200),
+            }),
+          )
+          .default([]),
+        customSkills: z.string().max(2000).nullable().optional(),
+      }),
+    )
+    .default([]),
 });
 
 const AddMemberSchema = z.object({
@@ -91,19 +110,43 @@ export class ConversationController {
   async create(@Body() body: unknown): Promise<ConversationSummary> {
     const parsed = CreateConversationSchema.safeParse(body);
     if (!parsed.success) throw new BadRequestException(parsed.error.flatten());
+    const configuredMembers =
+      parsed.data.type === 'group' ? parsed.data.memberConfigs : [];
     const conv = await this.convs.create({
       type: parsed.data.type,
       title: parsed.data.title,
       groupSystemPrompt: parsed.data.groupSystemPrompt ?? null,
-      memberAgentIds: parsed.data.memberAgentIds,
+      memberAgentIds: configuredMembers.length > 0 ? [] : parsed.data.memberAgentIds,
     });
+    const configuredMemberIds: string[] = [];
+    for (const cfg of configuredMembers) {
+      const template = await this.agents.getById(cfg.roleAgentId);
+      if (!template) throw new NotFoundException(`role agent ${cfg.roleAgentId} not found`);
+      const scoped = await this.agents.create({
+        id: `conv-agent-${conv.id}-${cfg.roleAgentId}`,
+        name: template.name,
+        adapterId: cfg.adapterId,
+        model: cfg.model ?? null,
+        systemPrompt: composeRoleSystemPrompt({
+          basePrompt: template.systemPrompt,
+          roleName: template.name,
+          modelLabel: cfg.model ?? cfg.adapterId,
+          skills: cfg.skills,
+          customSkills: cfg.customSkills ?? null,
+        }),
+        avatarColor: template.avatarColor,
+        isPublic: false,
+      });
+      configuredMemberIds.push(scoped.id);
+      await this.convs.addMember(conv.id, scoped.id);
+    }
     if (parsed.data.type === 'group') {
       await this.workspace.initializeProject(conv.id, {
         title: parsed.data.title,
-        memberIds: parsed.data.memberAgentIds,
+        memberIds: configuredMembers.length > 0 ? configuredMemberIds : parsed.data.memberAgentIds,
       });
     }
-    return conv;
+    return (await this.convs.getById(conv.id)) ?? conv;
   }
 
   @Put('conversations/:id')
@@ -124,6 +167,7 @@ export class ConversationController {
   @HttpCode(204)
   async remove(@Param('id') id: string): Promise<void> {
     await this.convs.delete(id);
+    await this.agents.deleteScopedForConversation(id);
   }
 
   @Get('conversations/:id/state')
@@ -201,4 +245,27 @@ export class ConversationController {
     await this.agents.delete(id);
     this.adapterFactory.invalidate(id);
   }
+}
+
+function composeRoleSystemPrompt(input: {
+  basePrompt: string;
+  roleName: string;
+  modelLabel: string;
+  skills: Array<{ id: string; label: string; prompt: string }>;
+  customSkills: string | null;
+}): string {
+  const blocks = [
+    input.basePrompt.trim(),
+    `## 运行配置\n- 身份：${input.roleName}\n- 模型：${input.modelLabel}\n- 工作方式：按身份职责输出，不要冒充其他成员；需要文件或命令时优先使用 workspace/terminal 工具。`,
+  ].filter(Boolean);
+
+  if (input.skills.length > 0 || input.customSkills?.trim()) {
+    const skillBlocks = input.skills.map((s) => `### ${s.label}\n${s.prompt.trim()}`);
+    if (input.customSkills?.trim()) {
+      skillBlocks.push(`### 自定义 Skill\n${input.customSkills.trim()}`);
+    }
+    blocks.push(`## Skills\n${skillBlocks.join('\n\n')}`);
+  }
+
+  return blocks.join('\n\n');
 }

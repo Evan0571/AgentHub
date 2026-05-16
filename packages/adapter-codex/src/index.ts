@@ -235,15 +235,15 @@ export class CodexAdapter implements AgentAdapter {
     const out: Array<Record<string, unknown>> = [];
     if (systemPrompt) out.push({ role: 'system', content: systemPrompt });
     for (const m of msgs) {
-      const content =
-        typeof m.content === 'string'
-          ? m.content
-          : m.content
-              .map((p) => (p.type === 'text' ? p.text : `[${p.type}]`))
-              .join('\n');
+      const content = toOpenAIContent(m.content);
       const row: Record<string, unknown> = {
         role: m.role,
-        content: m.toolCalls?.length && m.role === 'assistant' && !content ? null : content,
+        content:
+          m.toolCalls?.length &&
+          m.role === 'assistant' &&
+          ((typeof content === 'string' && !content) || (Array.isArray(content) && content.length === 0))
+            ? null
+            : content,
         ...(m.name ? { name: m.name } : {}),
         ...(m.toolCallId ? { tool_call_id: m.toolCallId } : {}),
       };
@@ -261,6 +261,20 @@ export class CodexAdapter implements AgentAdapter {
     }
     return out;
   }
+}
+
+function toOpenAIContent(content: Message['content']): string | Array<Record<string, unknown>> {
+  if (typeof content === 'string') return content;
+  return content.map((p) => {
+    if (p.type === 'text') return { type: 'text', text: p.text };
+    if (p.type === 'image') {
+      return {
+        type: 'image_url',
+        image_url: { url: `data:${p.mimeType};base64,${p.base64}` },
+      };
+    }
+    return { type: 'text', text: `[tool_result] ${JSON.stringify(p.result)}` };
+  });
 }
 
 /* ----------------------------------------------------------- helpers ----- */

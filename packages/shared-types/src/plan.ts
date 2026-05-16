@@ -12,6 +12,10 @@ export type TaskStatus =
 export interface PlanTask {
   id: ID;
   goal: string;
+  /** Longer planning note shown in the Plan panel and mirrored to TASKS.md. */
+  details?: string;
+  deliverables?: string[];
+  checklist?: string[];
   assigneeAgentId?: ID;             // null = not yet assigned
   inputs: ID[];                     // upstream task ids
   acceptance: AcceptanceRule[];

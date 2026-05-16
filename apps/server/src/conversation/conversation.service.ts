@@ -24,6 +24,7 @@ export class ConversationService {
         senderType: 'user',
         senderId: 'me',
         text: event.content.text,
+        attachments: event.content.attachments,
       });
     } catch (e) {
       this.log.warn(`persist user msg failed: ${(e as Error).message}`);

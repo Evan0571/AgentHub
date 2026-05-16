@@ -1,82 +1,253 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import { Loader2, MessageSquare, Sparkles, Users, X } from 'lucide-react';
+import { useMemo, useState, type ReactNode } from 'react';
+import { Check, Loader2, MessageSquare, Sparkles, Users, X } from 'lucide-react';
 import clsx from 'clsx';
-import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
+import { isConversationScopedAgentId, isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
 
-/** A reasonable default for a new group — user can clear / rewrite. */
-const DEFAULT_GROUP_RULES = `- 全员使用中文回复，结论先行、简洁、避免空话
-- 代码块标注语言 + path=相对路径，多文件项目入口命名为 App.tsx 或 main.tsx
-- 修改已有文件优先输出 unified diff（语言标 \`diff\`），不要重发整文件
-- 多 Agent 协作时只产出自己负责的部分，不替别人写、不做横向对比
-- 完成后用一句话总结改动`;
+const DEFAULT_GROUP_RULES = `- 全员使用中文回复，结论先行，避免空话。
+- 架构师负责拆解和排期，不由系统 Orchestrator 代替规划。
+- 涉及代码时必须写入 workspace；修改已有文件优先使用 diff。
+- 实现任务必须给出验证方式；能运行命令时优先用 terminal 验证。
+- 每个成员只输出自己身份负责的部分，不冒充其他成员。`;
 
-const PROJECT_TEAM_IDS = [
-  'product-analyst',
-  'solution-architect',
-  'frontend-engineer',
-  'backend-engineer',
-  'code-reviewer',
-  'env-engineer',
-  'qa-tester',
-  'senior-user',
-  'risk-critic',
-];
+const MODEL_OPTIONS = [
+  {
+    id: 'deepseek-v4-flash',
+    label: 'V4 Flash',
+    detail: '快 / 便宜 / 日常分析',
+    adapterId: 'deepseek-v4-flash',
+    model: 'deepseek-v4-flash',
+  },
+  {
+    id: 'deepseek-v4-pro',
+    label: 'V4 Pro',
+    detail: '强推理 / 架构 / 风险',
+    adapterId: 'deepseek-v4-pro',
+    model: 'deepseek-v4-pro',
+  },
+  {
+    id: 'codex',
+    label: 'Codex',
+    detail: '代码实现 / 文件编辑',
+    adapterId: 'codex',
+    model: 'gpt-4o',
+  },
+] as const;
 
-/**
- * Modal: pick conv type, name it, choose initial members.
- * Submits POST /api/conversations and sets the new conv as active.
- */
+type ModelId = (typeof MODEL_OPTIONS)[number]['id'];
+
+const SKILL_LIBRARY = [
+  {
+    id: 'requirements',
+    label: '需求澄清',
+    prompt: '先把目标、用户、边界、非目标和验收标准澄清，再进入实现。',
+  },
+  {
+    id: 'task-dag',
+    label: '任务 DAG',
+    prompt: '把复杂项目拆成可验证的有向任务；每个任务必须有输入、产物、验收方式和依赖关系。',
+  },
+  {
+    id: 'workspace-first',
+    label: 'Workspace 优先',
+    prompt: '涉及代码或文档时优先读写 workspace 文件，不只在聊天里贴代码。',
+  },
+  {
+    id: 'terminal-verify',
+    label: '终端验证',
+    prompt: '完成实现后必须说明并尽量执行验证命令，失败时基于真实报错继续修复。',
+  },
+  {
+    id: 'ui-polish',
+    label: '界面打磨',
+    prompt: '检查信息层级、空状态、按钮对比度、响应式布局和交互反馈，避免通用 AI 风格。',
+  },
+  {
+    id: 'api-contract',
+    label: '接口契约',
+    prompt: '先定义接口、数据结构、错误格式和状态流，再写前后端联调逻辑。',
+  },
+  {
+    id: 'risk-scan',
+    label: '风险审视',
+    prompt: '主动找安全、隐私、越权、部署、成本、不可行假设和边界条件风险。',
+  },
+  {
+    id: 'user-acceptance',
+    label: '用户验收',
+    prompt: '以真实用户视角检查流程是否顺手、文案是否明确、产物是否解决原问题。',
+  },
+] as const;
+
+type SkillId = (typeof SKILL_LIBRARY)[number]['id'];
+
+const ROLE_SLOTS = [
+  {
+    id: 'product-analyst',
+    badge: 'PM',
+    name: '产品分析师',
+    summary: '目标、用户、范围、验收',
+    defaultModel: 'deepseek-v4-flash' as ModelId,
+    defaultSkills: ['requirements', 'user-acceptance'] as SkillId[],
+  },
+  {
+    id: 'solution-architect',
+    badge: 'AR',
+    name: '架构师',
+    summary: '架构、模块、任务 DAG',
+    defaultModel: 'deepseek-v4-pro' as ModelId,
+    defaultSkills: ['task-dag', 'api-contract', 'risk-scan'] as SkillId[],
+  },
+  {
+    id: 'frontend-engineer',
+    badge: 'FE',
+    name: '前端工程师',
+    summary: '页面、交互、预览产物',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: ['workspace-first', 'ui-polish', 'terminal-verify'] as SkillId[],
+  },
+  {
+    id: 'backend-engineer',
+    badge: 'BE',
+    name: '后端工程师',
+    summary: 'API、数据、服务逻辑',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: ['workspace-first', 'api-contract', 'terminal-verify'] as SkillId[],
+  },
+  {
+    id: 'code-reviewer',
+    badge: 'CR',
+    name: 'Code Reviewer',
+    summary: '代码审查、回归风险',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: ['risk-scan', 'terminal-verify'] as SkillId[],
+  },
+  {
+    id: 'env-engineer',
+    badge: 'EV',
+    name: '环境配置员',
+    summary: '依赖、脚本、部署前检查',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: ['workspace-first', 'terminal-verify'] as SkillId[],
+  },
+  {
+    id: 'qa-tester',
+    badge: 'QA',
+    name: '测试员',
+    summary: '测试计划、真实错误复现',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: ['terminal-verify', 'user-acceptance'] as SkillId[],
+  },
+  {
+    id: 'senior-user',
+    badge: 'UX',
+    name: '资深用户',
+    summary: '体验评估、真实使用反馈',
+    defaultModel: 'deepseek-v4-flash' as ModelId,
+    defaultSkills: ['user-acceptance', 'ui-polish'] as SkillId[],
+  },
+  {
+    id: 'risk-critic',
+    badge: 'RK',
+    name: '风险审视员',
+    summary: '边界、误用、安全、不可行假设',
+    defaultModel: 'deepseek-v4-pro' as ModelId,
+    defaultSkills: ['risk-scan', 'task-dag'] as SkillId[],
+  },
+] as const;
+
+type RoleId = (typeof ROLE_SLOTS)[number]['id'];
+
+type RoleConfig = {
+  selected: boolean;
+  modelId: ModelId;
+  skillIds: SkillId[];
+  customSkills: string;
+};
+
+const initialRoleConfigs = (): Record<RoleId, RoleConfig> =>
+  Object.fromEntries(
+    ROLE_SLOTS.map((role) => [
+      role.id,
+      {
+        selected: true,
+        modelId: role.defaultModel,
+        skillIds: [...role.defaultSkills],
+        customSkills: '',
+      },
+    ]),
+  ) as Record<RoleId, RoleConfig>;
+
 export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const agents = useConversationStore((s) => s.agents);
   const createConversation = useConversationStore((s) => s.createConversation);
 
   const [type, setType] = useState<'single' | 'group'>('group');
   const [title, setTitle] = useState('');
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [groupRules, setGroupRules] = useState('');
-  const [didAutoSelectTeam, setDidAutoSelectTeam] = useState(false);
+  const [singleSelected, setSingleSelected] = useState<Set<string>>(new Set());
+  const [roleConfigs, setRoleConfigs] = useState<Record<RoleId, RoleConfig>>(initialRoleConfigs);
+  const [activeRoleId, setActiveRoleId] = useState<RoleId>('solution-architect');
+  const [groupRules, setGroupRules] = useState(DEFAULT_GROUP_RULES);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Built-in agents come first, then user-created ones.
-  const sortedAgents = useMemo(
+  const availableRoleIds = useMemo(
+    () => new Set(ROLE_SLOTS.filter((role) => agents.some((a) => a.id === role.id)).map((role) => role.id)),
+    [agents],
+  );
+  const selectedRoleIds = useMemo(
+    () => ROLE_SLOTS.filter((role) => roleConfigs[role.id].selected && availableRoleIds.has(role.id)).map((role) => role.id),
+    [availableRoleIds, roleConfigs],
+  );
+  const singleAgents = useMemo(
     () =>
-      agents.filter((a) => !isHiddenSystemAgentId(a.id)).sort((a, b) => {
-        if (a.isPublic !== b.isPublic) return a.isPublic ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      }),
-    [agents],
-  );
-  const projectTeamIds = useMemo(
-    () => PROJECT_TEAM_IDS.filter((id) => agents.some((a) => a.id === id)),
+      agents
+        .filter((a) => !isHiddenSystemAgentId(a.id) && !isConversationScopedAgentId(a.id))
+        .sort((a, b) => {
+          if (a.isPublic !== b.isPublic) return a.isPublic ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        }),
     [agents],
   );
 
-  useEffect(() => {
-    if (type !== 'group' || didAutoSelectTeam || selected.size > 0 || projectTeamIds.length === 0) return;
-    setSelected(new Set(projectTeamIds));
-    setDidAutoSelectTeam(true);
-  }, [didAutoSelectTeam, projectTeamIds, selected.size, type]);
+  const activeRole = ROLE_SLOTS.find((role) => role.id === activeRoleId) ?? ROLE_SLOTS[0];
+  const activeConfig = roleConfigs[activeRole.id];
+  const canSubmit =
+    title.trim().length > 0 &&
+    !busy &&
+    (type === 'group' ? selectedRoleIds.length > 0 : singleSelected.size === 1);
 
-  const toggle = (id: string) => {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      if (type === 'single' && next.size > 1) {
-        // single chat: only one member.
-        const arr = [...next];
-        return new Set([arr[arr.length - 1]!]);
-      }
-      return next;
-    });
+  const setRoleConfig = (roleId: RoleId, patch: Partial<RoleConfig>) => {
+    setRoleConfigs((prev) => ({
+      ...prev,
+      [roleId]: { ...prev[roleId], ...patch },
+    }));
   };
 
-  const canSubmit = title.trim().length > 0 && selected.size > 0 && !busy;
+  const toggleRole = (roleId: RoleId) => {
+    setActiveRoleId(roleId);
+    if (!availableRoleIds.has(roleId)) return;
+    setRoleConfig(roleId, { selected: !roleConfigs[roleId].selected });
+  };
+
+  const toggleSkill = (skillId: SkillId) => {
+    const skillIds = activeConfig.skillIds.includes(skillId)
+      ? activeConfig.skillIds.filter((id) => id !== skillId)
+      : [...activeConfig.skillIds, skillId];
+    setRoleConfig(activeRole.id, { skillIds });
+  };
+
+  const selectStandardTeam = () => {
+    setRoleConfigs(initialRoleConfigs());
+    setActiveRoleId('solution-architect');
+  };
+
+  const selectSingleAgent = (id: string) => {
+    setSingleSelected(new Set([id]));
+  };
 
   const onSubmit = async () => {
     if (!canSubmit) return;
@@ -86,7 +257,24 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
       await createConversation({
         type,
         title: title.trim(),
-        memberAgentIds: [...selected],
+        memberAgentIds: type === 'single' ? [...singleSelected] : [],
+        memberConfigs:
+          type === 'group'
+            ? selectedRoleIds.map((roleId) => {
+                const cfg = roleConfigs[roleId];
+                const model = MODEL_OPTIONS.find((item) => item.id === cfg.modelId) ?? MODEL_OPTIONS[0];
+                return {
+                  roleAgentId: roleId,
+                  adapterId: model.adapterId,
+                  model: model.model,
+                  skills: cfg.skillIds
+                    .map((id) => SKILL_LIBRARY.find((skill) => skill.id === id))
+                    .filter((skill): skill is (typeof SKILL_LIBRARY)[number] => Boolean(skill))
+                    .map((skill) => ({ id: skill.id, label: skill.label, prompt: skill.prompt })),
+                  customSkills: cfg.customSkills.trim() ? cfg.customSkills.trim() : null,
+                };
+              })
+            : undefined,
         groupSystemPrompt: type === 'group' && groupRules.trim() ? groupRules.trim() : null,
       });
       onClose();
@@ -98,25 +286,22 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <ModalShell onClose={onClose} title="新建会话">
-      <div className="space-y-3">
-        <div className="flex gap-2">
+    <ModalShell onClose={onClose} title="新建会话" width="w-[780px]">
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-2">
           <TypeBtn
             active={type === 'group'}
             onClick={() => setType('group')}
             icon={<Users className="h-4 w-4" />}
-            label="群聊"
-            hint="多个 Agent 协作 · @ 路由"
+            label="项目群"
+            hint="选身份，再给每个身份配置模型和 Skills"
           />
           <TypeBtn
             active={type === 'single'}
-            onClick={() => {
-              setType('single');
-              if (selected.size > 1) setSelected(new Set([[...selected][0]!]));
-            }}
+            onClick={() => setType('single')}
             icon={<MessageSquare className="h-4 w-4" />}
             label="单聊"
-            hint="只和一个 Agent 对话"
+            hint="直接和一个现有 Agent 对话"
           />
         </div>
 
@@ -126,118 +311,236 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
             autoFocus
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder={type === 'group' ? '如：「待办应用工程群」' : '如：「我 + DeepSeek V3」'}
-            className="mt-0.5 w-full rounded bg-bg/60 px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-accent"
+            placeholder={type === 'group' ? '例如：小游戏官网增长项目' : '例如：我 + Codex'}
+            className="mt-1 w-full rounded-md border border-white/10 bg-bg/70 px-3 py-2 text-sm outline-none transition focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
           />
         </label>
 
-        <div>
-          <div className="flex items-baseline justify-between">
-            <span className="text-[10px] uppercase tracking-wider text-text-muted">
-              成员（已选 {selected.size}）
-            </span>
-            {type === 'single' ? (
-              <span className="text-[10px] text-text-muted/70">单聊只能选 1 个</span>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setSelected(new Set(projectTeamIds))}
-                disabled={projectTeamIds.length === 0}
-                className="rounded px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/10 disabled:opacity-40"
-              >
-                选择标准项目团队
-              </button>
-            )}
-          </div>
-          <div className="mt-0.5 max-h-64 space-y-1 overflow-y-auto rounded-md border border-white/5 bg-bg/40 p-1">
-            {sortedAgents.length === 0 ? (
-              <div className="px-2 py-4 text-center text-xs text-text-muted">
-                还没有 Agent — 关闭后到设置里新建
+        {type === 'group' ? (
+          <div className="grid gap-3 lg:grid-cols-[1fr_1.08fr]">
+            <section className="rounded-lg border border-white/10 bg-bg/35">
+              <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+                <div>
+                  <div className="text-xs font-semibold text-text">身份席位</div>
+                  <div className="text-[10px] text-text-muted">已选 {selectedRoleIds.length} / {ROLE_SLOTS.length}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={selectStandardTeam}
+                  className="rounded px-2 py-1 text-[10px] text-accent hover:bg-accent/10"
+                >
+                  恢复标准团队
+                </button>
               </div>
-            ) : (
-              sortedAgents.map((a) => {
-                const checked = selected.has(a.id);
+              <div className="max-h-[360px] space-y-1 overflow-y-auto p-2">
+                {ROLE_SLOTS.map((role) => {
+                  const cfg = roleConfigs[role.id];
+                  const model = MODEL_OPTIONS.find((m) => m.id === cfg.modelId);
+                  const unavailable = !availableRoleIds.has(role.id);
+                  return (
+                    <div
+                      key={role.id}
+                      className={clsx(
+                        'flex w-full items-center gap-2 rounded-md border px-2 py-2 transition',
+                        activeRoleId === role.id ? 'border-accent/40 bg-accent/10' : 'border-transparent hover:bg-bg-soft/80',
+                        cfg.selected && !unavailable ? 'text-text' : 'text-text-muted',
+                        unavailable && 'opacity-40',
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => toggleRole(role.id)}
+                        disabled={unavailable}
+                        className={clsx(
+                          'flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[10px] font-bold',
+                          cfg.selected && !unavailable ? 'bg-accent text-white' : 'bg-bg-soft text-text-muted',
+                        )}
+                        title={cfg.selected ? '移出团队' : '加入团队'}
+                      >
+                        {cfg.selected && !unavailable ? <Check className="h-3.5 w-3.5" /> : role.badge}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveRoleId(role.id)}
+                        className="min-w-0 flex-1 text-left"
+                      >
+                        <span className="flex items-center gap-2">
+                          <span className="truncate text-sm font-medium">{role.name}</span>
+                          <span className="rounded bg-bg-soft px-1.5 py-0.5 text-[9px] text-text-muted">
+                            {model?.label}
+                          </span>
+                        </span>
+                        <span className="block truncate text-[10px] text-text-muted">{role.summary}</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className="rounded-lg border border-white/10 bg-bg/35">
+              <div className="border-b border-white/5 px-3 py-2">
+                <div className="flex items-center gap-2">
+                  <span className="rounded bg-accent/10 px-2 py-1 text-[10px] font-semibold text-accent">
+                    {activeRole.badge}
+                  </span>
+                  <div>
+                    <div className="text-xs font-semibold text-text">{activeRole.name}</div>
+                    <div className="text-[10px] text-text-muted">{activeRole.summary}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4 p-3">
+                <div>
+                  <div className="mb-1.5 text-[10px] uppercase tracking-wider text-text-muted">模型</div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {MODEL_OPTIONS.map((model) => (
+                      <button
+                        key={model.id}
+                        type="button"
+                        onClick={() => setRoleConfig(activeRole.id, { modelId: model.id })}
+                        className={clsx(
+                          'rounded-md border px-2 py-2 text-left transition',
+                          activeConfig.modelId === model.id
+                            ? 'border-accent/45 bg-accent/10 text-text'
+                            : 'border-white/5 bg-bg/60 text-text-muted hover:text-text',
+                        )}
+                      >
+                        <span className="block text-xs font-semibold">{model.label}</span>
+                        <span className="block text-[10px]">{model.detail}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-[10px] uppercase tracking-wider text-text-muted">Skills</span>
+                    <span className="text-[10px] text-text-muted">会注入到该身份的 system prompt</span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SKILL_LIBRARY.map((skill) => {
+                      const active = activeConfig.skillIds.includes(skill.id);
+                      return (
+                        <button
+                          key={skill.id}
+                          type="button"
+                          onClick={() => toggleSkill(skill.id)}
+                          className={clsx(
+                            'rounded-full border px-2 py-1 text-[11px] transition',
+                            active
+                              ? 'border-accent/40 bg-accent/10 text-accent'
+                              : 'border-white/5 bg-bg/60 text-text-muted hover:text-text',
+                          )}
+                          title={skill.prompt}
+                        >
+                          {skill.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <label className="block">
+                  <span className="text-[10px] uppercase tracking-wider text-text-muted">自定义 Skill</span>
+                  <textarea
+                    value={activeConfig.customSkills}
+                    onChange={(e) => setRoleConfig(activeRole.id, { customSkills: e.target.value })}
+                    rows={3}
+                    placeholder="例如：熟悉 shadcn/ui 和 Radix；所有交互必须先检查键盘可访问性。"
+                    className="mt-1 w-full resize-none rounded-md border border-white/10 bg-bg/60 px-2 py-1.5 text-xs leading-relaxed outline-none transition focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
+                  />
+                </label>
+              </div>
+            </section>
+          </div>
+        ) : (
+          <section className="rounded-lg border border-white/10 bg-bg/35">
+            <div className="border-b border-white/5 px-3 py-2">
+              <div className="text-xs font-semibold text-text">选择 Agent</div>
+              <div className="text-[10px] text-text-muted">单聊使用已有 Agent，不创建项目团队席位。</div>
+            </div>
+            <div className="max-h-72 space-y-1 overflow-y-auto p-2">
+              {singleAgents.map((agent) => {
+                const checked = singleSelected.has(agent.id);
                 return (
                   <button
                     type="button"
-                    key={a.id}
-                    onClick={() => toggle(a.id)}
+                    key={agent.id}
+                    onClick={() => selectSingleAgent(agent.id)}
                     className={clsx(
-                      'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition',
-                      checked ? 'bg-accent/20' : 'hover:bg-white/5',
+                      'flex w-full items-center gap-2 rounded-md border px-2 py-2 text-left transition',
+                      checked ? 'border-accent/40 bg-accent/10' : 'border-transparent hover:bg-bg-soft/80',
                     )}
                   >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      readOnly
-                      className="pointer-events-none"
-                    />
-                    <AgentAvatar
-                      name={a.name}
-                      adapterId={a.adapterId}
-                      color={a.avatarColor}
-                      size={24}
-                    />
+                    <AgentAvatar name={agent.name} adapterId={agent.adapterId} color={agent.avatarColor} size={28} />
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{a.name}</span>
+                      <span className="block truncate text-sm font-medium">{agent.name}</span>
                       <span className="block truncate text-[10px] text-text-muted">
-                        {a.isPublic ? '内置' : '自定义'} · {a.adapterId}
+                        {agent.isPublic ? '内置' : '自定义'} · {agent.adapterId}
+                        {agent.model ? ` / ${agent.model}` : ''}
                       </span>
                     </span>
+                    {checked ? <Check className="h-4 w-4 text-accent" /> : null}
                   </button>
                 );
-              })
-            )}
-          </div>
-        </div>
+              })}
+            </div>
+          </section>
+        )}
 
         {type === 'group' ? (
-          <div>
-            <div className="flex items-baseline justify-between">
-              <span className="text-[10px] uppercase tracking-wider text-text-muted">
-                群规则（可选 · 注入到每个成员的 system prompt）
-              </span>
+          <label className="block">
+            <div className="mb-1 flex items-center justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-text-muted">团队协议</span>
               <button
                 type="button"
                 onClick={() => setGroupRules(DEFAULT_GROUP_RULES)}
                 className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/10"
-                title="套用默认协作规则模板"
               >
                 <Sparkles className="h-2.5 w-2.5" />
-                用默认模板
+                默认模板
               </button>
             </div>
             <textarea
               value={groupRules}
               onChange={(e) => setGroupRules(e.target.value)}
               rows={4}
-              placeholder='留空 = 不注入 · 点上面的「用默认模板」可一键生成协作规则'
-              className="mt-0.5 w-full resize-none rounded bg-bg/60 px-2 py-1.5 font-mono text-xs leading-relaxed outline-none focus:ring-1 focus:ring-accent"
+              className="w-full resize-none rounded-md border border-white/10 bg-bg/60 px-2 py-1.5 text-xs leading-relaxed outline-none transition focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
             />
-          </div>
+          </label>
         ) : null}
 
         {err ? (
-          <div className="rounded bg-rose-500/10 px-2 py-1 text-[11px] text-rose-300">{err}</div>
+          <div className="rounded-md border border-rose-500/20 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-300">
+            {err}
+          </div>
         ) : null}
       </div>
 
-      <div className="mt-4 flex justify-end gap-2">
-        <button
-          onClick={onClose}
-          className="rounded px-3 py-1.5 text-xs text-text-muted hover:bg-white/5 hover:text-text"
-        >
-          取消
-        </button>
-        <button
-          onClick={onSubmit}
-          disabled={!canSubmit}
-          className="flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:opacity-40"
-        >
-          {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-          创建
-        </button>
+      <div className="mt-4 flex items-center justify-between border-t border-white/5 pt-3">
+        <div className="text-[10px] text-text-muted">
+          {type === 'group'
+            ? '创建后会为每个身份生成独立 Agent：身份不变，模型和 Skills 可独立配置。'
+            : '单聊不会生成项目 workspace 团队配置。'}
+        </div>
+        <div className="flex gap-2">
+          <button
+            onClick={onClose}
+            className="rounded px-3 py-1.5 text-xs text-text-muted hover:bg-white/5 hover:text-text"
+          >
+            取消
+          </button>
+          <button
+            onClick={onSubmit}
+            disabled={!canSubmit}
+            className="flex items-center gap-1 rounded-md bg-accent px-3 py-1.5 text-xs text-white hover:bg-accent-hover disabled:opacity-40"
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            创建
+          </button>
+        </div>
       </div>
     </ModalShell>
   );
@@ -252,25 +555,26 @@ function TypeBtn({
 }: {
   active: boolean;
   onClick: () => void;
-  icon: React.ReactNode;
+  icon: ReactNode;
   label: string;
   hint: string;
 }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       className={clsx(
-        'flex flex-1 flex-col items-start gap-0.5 rounded-md border p-2 text-left text-xs transition',
+        'flex flex-col items-start gap-1 rounded-lg border p-3 text-left transition',
         active
           ? 'border-accent/40 bg-accent/10 text-text'
-          : 'border-white/5 bg-bg/60 text-text-muted hover:border-white/10 hover:text-text',
+          : 'border-white/10 bg-bg/50 text-text-muted hover:border-white/15 hover:text-text',
       )}
     >
-      <span className="flex items-center gap-1.5 font-medium">
+      <span className="flex items-center gap-2 text-sm font-semibold">
         {icon}
         {label}
       </span>
-      <span className="text-[10px] text-text-muted">{hint}</span>
+      <span className="text-[11px] text-text-muted">{hint}</span>
     </button>
   );
 }
@@ -283,25 +587,28 @@ export function ModalShell({
 }: {
   onClose: () => void;
   title: string;
-  children: React.ReactNode;
+  children: ReactNode;
   width?: string;
 }) {
   return (
     <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 p-4"
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
         className={clsx(
-          'rounded-lg border border-white/10 bg-bg-soft shadow-2xl',
+          'rounded-xl border border-white/10 bg-bg-soft shadow-2xl',
           width,
           'max-h-[90vh] overflow-y-auto',
         )}
       >
         <header className="flex items-center justify-between border-b border-white/5 px-4 py-3">
-          <h2 className="text-sm font-semibold text-text">{title}</h2>
+          <div>
+            <h2 className="text-sm font-semibold text-text">{title}</h2>
+            <p className="mt-0.5 text-[10px] text-text-muted">身份、模型、Skills 分开配置。</p>
+          </div>
           <button
             onClick={onClose}
             className="rounded p-1 text-text-muted hover:bg-white/5 hover:text-text"

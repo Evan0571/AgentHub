@@ -31,12 +31,13 @@ import { ADAPTER_REGISTRY } from './constants.js';
         registry.register(wrap(new MockAdapter()));
 
         if (process.env.DEEPSEEK_API_KEY) {
-          // Register V3 and R1 side-by-side; Orchestrator picks by capability/role.
           registry.register(
             wrap(
               new DeepSeekAdapter({
                 apiKey: process.env.DEEPSEEK_API_KEY,
-                model: 'deepseek-chat',
+                model: process.env.DEEPSEEK_FAST_MODEL ?? 'deepseek-v4-flash',
+                id: 'deepseek-v4-flash',
+                displayName: 'DeepSeek V4 Flash',
               }),
             ),
           );
@@ -44,7 +45,30 @@ import { ADAPTER_REGISTRY } from './constants.js';
             wrap(
               new DeepSeekAdapter({
                 apiKey: process.env.DEEPSEEK_API_KEY,
-                model: 'deepseek-reasoner',
+                model: process.env.DEEPSEEK_REASONING_MODEL ?? 'deepseek-v4-pro',
+                id: 'deepseek-v4-pro',
+                displayName: 'DeepSeek V4 Pro',
+              }),
+            ),
+          );
+          // Hidden compatibility aliases for old test conversations/plans.
+          registry.register(
+            wrap(
+              new DeepSeekAdapter({
+                apiKey: process.env.DEEPSEEK_API_KEY,
+                model: process.env.DEEPSEEK_FAST_MODEL ?? 'deepseek-v4-flash',
+                id: 'deepseek-v3',
+                displayName: 'DeepSeek V4 Flash',
+              }),
+            ),
+          );
+          registry.register(
+            wrap(
+              new DeepSeekAdapter({
+                apiKey: process.env.DEEPSEEK_API_KEY,
+                model: process.env.DEEPSEEK_REASONING_MODEL ?? 'deepseek-v4-pro',
+                id: 'deepseek-r1',
+                displayName: 'DeepSeek V4 Pro',
               }),
             ),
           );

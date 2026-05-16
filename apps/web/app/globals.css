@@ -14,8 +14,8 @@
   --bg-panel: 22 26 35;
   --text: 231 233 238;
   --text-muted: 154 163 178;
-  --accent: 99 102 241;
-  --accent-hover: 124 127 245;
+  --accent: 20 184 166;
+  --accent-hover: 45 212 191;
   color-scheme: dark;
 }
 
@@ -25,8 +25,8 @@
   --bg-panel: 241 242 245;
   --text: 26 29 35;
   --text-muted: 107 114 128;
-  --accent: 79 70 229;
-  --accent-hover: 67 56 202;
+  --accent: 15 118 110;
+  --accent-hover: 17 94 89;
   color-scheme: light;
 }
 
@@ -57,8 +57,8 @@ body {
 .light .border-white\/10 { border-color: rgb(15 23 42 / 0.12); }
 .light .border-white\/20 { border-color: rgb(15 23 42 / 0.16); }
 .light .bg-white\/\[0\.02\] { background-color: rgb(15 23 42 / 0.025); }
+.light .bg-white\/\[0\.03\] { background-color: rgb(15 23 42 / 0.035); }
 .light .hover\:bg-white\/\[0\.02\]:hover { background-color: rgb(15 23 42 / 0.025); }
-.light .text-white { color: rgb(15 23 42); }
 
 /* Modal scrim still wants a dim layer in both modes, but black/60 reads
  * fine on a light page too — leave it. */

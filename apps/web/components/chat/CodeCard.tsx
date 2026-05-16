@@ -5,7 +5,6 @@ import { Check, Copy, FileCode2, Play } from 'lucide-react';
 import { useConversationStore } from '@/lib/store';
 import { isRunnable } from '@/lib/preview-utils';
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx';
 import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript';
 import javascript from 'react-syntax-highlighter/dist/esm/languages/prism/javascript';
@@ -62,7 +61,7 @@ export function CodeCard({ code, lang, filePath, blockUid }: CodeCardProps) {
   const displayLang = (lang || 'text').toLowerCase();
 
   return (
-    <div className="my-2 max-w-full overflow-hidden rounded-lg border border-white/10 bg-bg-soft/60">
+    <div className="my-2 max-w-full overflow-hidden rounded-lg border border-white/10 bg-bg-soft/40">
       <CardHeader
         code={code}
         lang={displayLang}
@@ -160,7 +159,7 @@ function CodeBody({ code, lang }: { code: string; lang: string }) {
     <div className="max-h-[60vh] overflow-auto">
       <SyntaxHighlighter
         language={lang}
-        style={oneDark}
+        style={calmCodeTheme}
         showLineNumbers
         wrapLongLines={false}
         customStyle={{
@@ -169,9 +168,10 @@ function CodeBody({ code, lang }: { code: string; lang: string }) {
           background: 'transparent',
           fontSize: '0.78rem',
           lineHeight: 1.55,
+          textShadow: 'none',
         }}
-        codeTagProps={{ style: { fontFamily: 'inherit' } }}
-        lineNumberStyle={{ color: '#475569', minWidth: '2em', paddingRight: '1em' }}
+        codeTagProps={{ style: { fontFamily: 'inherit', textShadow: 'none' } }}
+        lineNumberStyle={{ color: '#94a3b8', minWidth: '2em', paddingRight: '1em', textShadow: 'none' }}
       >
         {code.replace(/\n$/, '')}
       </SyntaxHighlighter>
@@ -209,3 +209,46 @@ function DiffBody({ code }: { code: string }) {
 function looksLikeUnifiedDiff(code: string): boolean {
   return /^@@\s.*@@/m.test(code) && /^[-+]/m.test(code);
 }
+
+const calmCodeTheme = {
+  'code[class*="language-"]': {
+    color: 'rgb(71 85 105)',
+    background: 'transparent',
+    textShadow: 'none',
+    fontFamily: 'inherit',
+  },
+  'pre[class*="language-"]': {
+    color: 'rgb(71 85 105)',
+    background: 'transparent',
+    textShadow: 'none',
+  },
+  comment: { color: 'rgb(148 163 184)', fontStyle: 'italic' },
+  prolog: { color: 'rgb(148 163 184)' },
+  doctype: { color: 'rgb(148 163 184)' },
+  cdata: { color: 'rgb(148 163 184)' },
+  punctuation: { color: 'rgb(100 116 139)' },
+  property: { color: 'rgb(15 118 110)' },
+  tag: { color: 'rgb(15 118 110)' },
+  boolean: { color: 'rgb(180 83 9)' },
+  number: { color: 'rgb(180 83 9)' },
+  constant: { color: 'rgb(180 83 9)' },
+  symbol: { color: 'rgb(180 83 9)' },
+  deleted: { color: 'rgb(190 18 60)' },
+  selector: { color: 'rgb(14 116 144)' },
+  attrName: { color: 'rgb(14 116 144)' },
+  string: { color: 'rgb(21 128 61)' },
+  char: { color: 'rgb(21 128 61)' },
+  builtin: { color: 'rgb(21 128 61)' },
+  inserted: { color: 'rgb(21 128 61)' },
+  operator: { color: 'rgb(71 85 105)' },
+  entity: { color: 'rgb(71 85 105)' },
+  url: { color: 'rgb(14 116 144)' },
+  atrule: { color: 'rgb(15 118 110)' },
+  attrValue: { color: 'rgb(21 128 61)' },
+  keyword: { color: 'rgb(15 118 110)', fontWeight: 600 },
+  function: { color: 'rgb(37 99 235)' },
+  className: { color: 'rgb(180 83 9)' },
+  regex: { color: 'rgb(21 128 61)' },
+  important: { color: 'rgb(190 18 60)', fontWeight: 600 },
+  variable: { color: 'rgb(71 85 105)' },
+} as const;

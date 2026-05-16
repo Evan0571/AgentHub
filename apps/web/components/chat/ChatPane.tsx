@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, AtSign } from 'lucide-react';
+import { Send, AtSign, FileText, Image as ImageIcon, Loader2, Paperclip, X } from 'lucide-react';
+import type { MessageAttachment } from '@agenthub/shared-types';
 import { MessageList } from './MessageList';
 import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
@@ -15,6 +16,10 @@ interface MentionState {
   query: string;
 }
 
+interface PendingAttachment extends MessageAttachment {
+  previewUrl?: string;
+}
+
 export function ChatPane() {
   const active = useConversationStore((s) =>
     s.conversations.find((c) => c.id === s.activeId),
@@ -22,9 +27,15 @@ export function ChatPane() {
   const sendUserMessage = useConversationStore((s) => s.sendUserMessage);
   const hydrate = useConversationStore((s) => s.hydrate);
   const [text, setText] = useState('');
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [mention, setMention] = useState<MentionState | null>(null);
   const [showMembers, setShowMembers] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const dragDepth = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -32,8 +43,14 @@ export function ChatPane() {
 
   // Reset on conversation switch.
   useEffect(() => {
+    attachments.forEach((file) => {
+      if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    });
+    setAttachments([]);
+    setUploadError(null);
     setText('');
     setMention(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active?.id]);
 
   // Fetch persisted history on mount + whenever the active conversation
@@ -116,10 +133,69 @@ export function ChatPane() {
   };
 
   const onSend = () => {
-    if (!text.trim()) return;
-    sendUserMessage(active.id, text);
+    if ((!text.trim() && attachments.length === 0) || uploading) return;
+    const sentAttachments: MessageAttachment[] = attachments.map(({ previewUrl: _previewUrl, ...file }) => file);
+    sendUserMessage(active.id, text, sentAttachments);
+    attachments.forEach((file) => {
+      if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    });
+    setAttachments([]);
     setText('');
     setMention(null);
+  };
+
+  const onPickFiles = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    void uploadFiles([...files]);
+  };
+
+  const uploadFiles = async (incoming: File[]) => {
+    const files = incoming.filter(Boolean);
+    if (files.length === 0) return;
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const uploaded = await Promise.all(
+        files.slice(0, 8).map(async (file) => {
+          if (file.size > 10 * 1024 * 1024) {
+            throw new Error(`${file.name} 超过 10MB`);
+          }
+          const base64 = await fileToDataUrl(file);
+          const res = await fetch(
+            apiUrl(`/api/conversations/${encodeURIComponent(active.id)}/workspace/upload`),
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: file.name,
+                mimeType: file.type || 'application/octet-stream',
+                base64,
+              }),
+            },
+          );
+          if (!res.ok) throw new Error(await res.text());
+          const saved = (await res.json()) as MessageAttachment;
+          return {
+            ...saved,
+            previewUrl: saved.kind === 'image' ? URL.createObjectURL(file) : undefined,
+          } satisfies PendingAttachment;
+        }),
+      );
+      setAttachments((prev) => [...prev, ...uploaded]);
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => {
+      const removed = prev.find((file) => file.id === id);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return prev.filter((file) => file.id !== id);
+    });
   };
 
   const openPickerManually = () => {
@@ -141,8 +217,56 @@ export function ChatPane() {
     }
   };
 
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    dragDepth.current += 1;
+    setDragOver(true);
+  };
+  const onDragLeave = () => {
+    dragDepth.current -= 1;
+    if (dragDepth.current <= 0) {
+      dragDepth.current = 0;
+      setDragOver(false);
+    }
+  };
+  const onDrop = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragOver(false);
+    void uploadFiles([...e.dataTransfer.files]);
+  };
+
+  const onPaste = (e: React.ClipboardEvent) => {
+    const files = [...e.clipboardData.items]
+      .filter((it) => it.kind === 'file')
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => f !== null);
+    if (files.length === 0) return;
+    // Don't also paste the binary as garbage text.
+    e.preventDefault();
+    void uploadFiles(files);
+  };
+
   return (
-    <main className="flex min-w-0 flex-1 flex-col bg-bg">
+    <main
+      className="relative flex min-w-0 flex-1 flex-col bg-bg"
+      onDragEnter={onDragEnter}
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes('Files')) e.preventDefault();
+      }}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {dragOver ? (
+        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center bg-accent/10 backdrop-blur-[1px]">
+          <div className="rounded-xl border-2 border-dashed border-accent/60 bg-bg/80 px-6 py-4 text-center">
+            <Paperclip className="mx-auto mb-1 h-5 w-5 text-accent" />
+            <div className="text-sm font-medium text-text">松开上传到本会话</div>
+            <div className="text-[11px] text-text-muted">图片 / 文本 / 代码 · 单个最大 10MB · 一次最多 8 个</div>
+          </div>
+        </div>
+      ) : null}
       <Banner />
       <header
         onClick={() => setShowMembers(true)}
@@ -174,6 +298,28 @@ export function ChatPane() {
           </div>
         ) : null}
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept="image/*,.txt,.md,.json,.csv,.ts,.tsx,.js,.jsx,.css,.html,.xml,.yaml,.yml,.pdf"
+          className="hidden"
+          onChange={(e) => void onPickFiles(e.currentTarget.files)}
+        />
+
+        {attachments.length > 0 || uploadError ? (
+          <div className="mb-2 rounded-lg border border-white/5 bg-white/[0.03] p-2">
+            {attachments.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {attachments.map((file) => (
+                  <AttachmentChip key={file.id} file={file} onRemove={() => removeAttachment(file.id)} />
+                ))}
+              </div>
+            ) : null}
+            {uploadError ? <div className="mt-1 text-[11px] text-rose-400">{uploadError}</div> : null}
+          </div>
+        ) : null}
+
         <div className="flex items-end gap-2 rounded-lg bg-white/5 p-2">
           <button
             type="button"
@@ -183,10 +329,20 @@ export function ChatPane() {
           >
             <AtSign className="h-4 w-4" />
           </button>
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="rounded p-1 text-text-muted hover:bg-white/5 hover:text-text disabled:opacity-40"
+            title="上传图片或文件"
+          >
+            {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Paperclip className="h-4 w-4" />}
+          </button>
           <textarea
             ref={inputRef}
             value={text}
             onChange={onTextChange}
+            onPaste={onPaste}
             onKeyUp={(e) => {
               // Re-evaluate on caret-only moves (arrow keys, mouse won't fire change).
               const ta = e.currentTarget;
@@ -210,7 +366,7 @@ export function ChatPane() {
           />
           <button
             onClick={onSend}
-            disabled={!text.trim()}
+            disabled={(!text.trim() && attachments.length === 0) || uploading}
             className="flex h-8 w-8 items-center justify-center rounded bg-accent text-white transition hover:bg-accent-hover disabled:opacity-40"
           >
             <Send className="h-4 w-4" />
@@ -230,9 +386,69 @@ export function ChatPane() {
   );
 }
 
+function AttachmentChip({
+  file,
+  onRemove,
+}: {
+  file: PendingAttachment;
+  onRemove: () => void;
+}) {
+  const Icon = file.kind === 'image' ? ImageIcon : FileText;
+  return (
+    <div className="group flex max-w-[240px] items-center gap-2 rounded-md border border-white/5 bg-bg-soft/80 px-2 py-1.5">
+      {file.previewUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={file.previewUrl} alt="" className="h-8 w-8 rounded object-cover" />
+      ) : (
+        <span className="flex h-8 w-8 items-center justify-center rounded bg-bg text-text-muted">
+          <Icon className="h-4 w-4" />
+        </span>
+      )}
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-xs text-text">{file.name}</span>
+        <span className="block text-[10px] text-text-muted">{formatBytes(file.size)}</span>
+      </span>
+      <button
+        type="button"
+        onClick={onRemove}
+        className="rounded p-0.5 text-text-muted hover:bg-white/5 hover:text-text"
+        title="移除附件"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(reader.error ?? new Error('read file failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function apiUrl(path: string): string {
+  if (typeof window === 'undefined') return `http://localhost:4000${path}`;
+  const hostname = window.location.hostname.includes(':')
+    ? `[${window.location.hostname}]`
+    : window.location.hostname;
+  return `${window.location.protocol}//${hostname}:4000${path}`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes)) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
+  return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
+}
+
 function describe(adapterId: string): string | undefined {
-  if (adapterId === 'deepseek-v3') return '通用 · 快 · 便宜';
-  if (adapterId === 'deepseek-r1') return '复杂推理 · 带思考链';
+  if (adapterId === 'deepseek-v4-flash') return 'V4 Flash · 快 · 便宜 · 支持思考';
+  if (adapterId === 'deepseek-v4-pro') return 'V4 Pro · 强推理 · 规划';
+  if (adapterId === 'deepseek-v3') return 'V4 Flash · 旧标识';
+  if (adapterId === 'deepseek-r1') return 'V4 Pro · 旧标识';
   if (adapterId === 'claude-code') return '代码 · 工具调用';
   if (adapterId === 'codex') return 'OpenAI · 代码沙箱';
   if (adapterId === 'doubao') return '中文 · 火山';

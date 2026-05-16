@@ -57,7 +57,7 @@ export const apiKeys = pgTable('api_keys', {
 });
 
 export const agents = pgTable('agents', {
-  // text not uuid: built-in agents use stable slug ids ('deepseek-v3',
+  // text not uuid: built-in agents use stable slug ids ('deepseek-v4-flash',
   // 'orchestrator', ...) so they survive re-seeding meaningfully.
   // Custom user agents still get crypto.randomUUID() at the application layer.
   id: text('id').primaryKey(),
@@ -117,7 +117,7 @@ export const messages = pgTable(
       .references(() => conversations.id, { onDelete: 'cascade' }),
     senderType: senderType('sender_type').notNull(),
     // text not uuid: senders can be a user UUID, an agent string id
-    // (e.g. 'deepseek-v3'), or 'orchestrator' / 'system'.
+    // (e.g. 'deepseek-v4-flash'), or 'orchestrator' / 'system'.
     senderId: text('sender_id').notNull(),
     contentType: text('content_type').notNull(),
     body: jsonb('body').notNull(),

@@ -19,21 +19,25 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { Plan, PlanEdit, PlanTask, TaskStatus } from '@agenthub/shared-types';
-import { useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
 
-const AGENTS = ['deepseek-v3', 'deepseek-r1', 'codex', 'claude-code', 'doubao', 'mock'] as const;
+const AGENTS = ['deepseek-v4-flash', 'deepseek-v4-pro', 'codex', 'claude-code', 'doubao', 'mock'] as const;
 
 const AGENT_NAME: Record<string, string> = {
-  'deepseek-v3': 'V3',
-  'deepseek-r1': 'R1',
+  'deepseek-v4-flash': 'V4F',
+  'deepseek-v4-pro': 'V4P',
+  'deepseek-v3': 'V4F',
+  'deepseek-r1': 'V4P',
   'claude-code': 'Claude',
   codex: 'Codex',
   doubao: '豆包',
   mock: 'Mock',
 };
 const AGENT_COLOR: Record<string, string> = {
-  'deepseek-v3': '#4f46e5',
-  'deepseek-r1': '#7c3aed',
+  'deepseek-v4-flash': '#0f766e',
+  'deepseek-v4-pro': '#2563eb',
+  'deepseek-v3': '#0f766e',
+  'deepseek-r1': '#2563eb',
   'claude-code': '#d97706',
   codex: '#10b981',
   doubao: '#ef4444',
@@ -43,6 +47,11 @@ const AGENT_COLOR: Record<string, string> = {
 export function PlanCard({ plan }: { plan: Plan }) {
   const grouped = useMemo(() => groupByDepth(plan), [plan]);
   const stats = useMemo(() => statsFor(plan), [plan]);
+  const agents = useConversationStore((s) => s.agents);
+  const assignableAgents = useMemo(
+    () => agents.filter((a) => !isHiddenSystemAgentId(a.id)),
+    [agents],
+  );
   const [editMode, setEditMode] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -100,6 +109,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
                 key={task.id}
                 plan={plan}
                 task={task}
+                agents={assignableAgents}
                 onCancel={() => setEditingId(null)}
                 onSave={(edits) => {
                   editPlan(plan.id, edits);
@@ -110,6 +120,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
               <TaskRow
                 key={task.id}
                 task={task}
+                agents={assignableAgents}
                 editMode={editMode}
                 onEdit={() => setEditingId(task.id)}
                 onDelete={() => {
@@ -132,6 +143,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
         adding ? (
           <NewTaskForm
             plan={plan}
+            agents={assignableAgents}
             onCancel={() => setAdding(false)}
             onCreate={(edits) => {
               editPlan(plan.id, edits);
@@ -154,17 +166,20 @@ export function PlanCard({ plan }: { plan: Plan }) {
 
 function TaskRow({
   task,
+  agents,
   editMode,
   onEdit,
   onDelete,
 }: {
   task: PlanTask;
+  agents: Array<{ id: string; name: string; avatarColor: string }>;
   editMode: boolean;
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  const agentName = task.assigneeAgentId ? AGENT_NAME[task.assigneeAgentId] ?? task.assigneeAgentId : '?';
-  const agentColor = task.assigneeAgentId ? AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280' : '#6b7280';
+  const profile = task.assigneeAgentId ? agents.find((a) => a.id === task.assigneeAgentId) : undefined;
+  const agentName = profile?.name ?? (task.assigneeAgentId ? AGENT_NAME[task.assigneeAgentId] ?? task.assigneeAgentId : '?');
+  const agentColor = profile?.avatarColor ?? (task.assigneeAgentId ? AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280' : '#6b7280');
 
   return (
     <div
@@ -211,6 +226,35 @@ function TaskRow({
               {task.error.code}: {task.error.message}
             </div>
           ) : null}
+          {task.details ? (
+            <p className="mt-2 rounded bg-white/[0.03] px-2 py-1.5 text-[11px] leading-relaxed text-text-muted">
+              {task.details}
+            </p>
+          ) : null}
+          {task.deliverables?.length || task.checklist?.length ? (
+            <div className="mt-2 grid gap-2 text-[10px] text-text-muted">
+              {task.deliverables?.length ? (
+                <div>
+                  <span className="uppercase tracking-wider text-text-muted/70">Deliverables</span>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                    {task.deliverables.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+              {task.checklist?.length ? (
+                <div>
+                  <span className="uppercase tracking-wider text-text-muted/70">Checklist</span>
+                  <ul className="mt-1 space-y-0.5">
+                    {task.checklist.map((item) => (
+                      <li key={item}>□ {item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
         {editMode ? (
           <div className="flex shrink-0 items-center gap-0.5 opacity-70 group-hover:opacity-100">
@@ -238,15 +282,18 @@ function TaskRow({
 function TaskEditor({
   plan,
   task,
+  agents,
   onCancel,
   onSave,
 }: {
   plan: Plan;
   task: PlanTask;
+  agents: Array<{ id: string; name: string }>;
   onCancel: () => void;
   onSave: (edits: PlanEdit[]) => void;
 }) {
   const [goal, setGoal] = useState(task.goal);
+  const [details, setDetails] = useState(task.details ?? '');
   const [assignee, setAssignee] = useState(task.assigneeAgentId ?? '');
   const [inputs, setInputs] = useState<string[]>(task.inputs);
 
@@ -256,6 +303,7 @@ function TaskEditor({
   const onSubmit = () => {
     const patch: Partial<PlanTask> = {};
     if (goal !== task.goal) patch.goal = goal.trim() || task.goal;
+    if (details !== (task.details ?? '')) patch.details = details.trim() || undefined;
     if (assignee !== (task.assigneeAgentId ?? '')) patch.assigneeAgentId = assignee || undefined;
     if (!arraysEqual(inputs, task.inputs)) patch.inputs = inputs;
     if (Object.keys(patch).length === 0) {
@@ -281,6 +329,16 @@ function TaskEditor({
         />
       </label>
       <label className="block">
+        <span className="text-[10px] text-text-muted">细节说明</span>
+        <textarea
+          value={details}
+          onChange={(e) => setDetails(e.target.value)}
+          rows={4}
+          className="mt-0.5 w-full resize-none rounded bg-bg/60 px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-accent"
+          placeholder="任务边界、输入输出、注意事项"
+        />
+      </label>
+      <label className="block">
         <span className="text-[10px] text-text-muted">Agent</span>
         <select
           value={assignee}
@@ -288,9 +346,9 @@ function TaskEditor({
           className="mt-0.5 w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-accent"
         >
           <option value="">（未指定）</option>
-          {AGENTS.map((a) => (
-            <option key={a} value={a}>
-              {AGENT_NAME[a]} ({a})
+          {agents.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.name} ({a.id})
             </option>
           ))}
         </select>
@@ -354,15 +412,18 @@ function TaskEditor({
 
 function NewTaskForm({
   plan,
+  agents,
   onCancel,
   onCreate,
 }: {
   plan: Plan;
+  agents: Array<{ id: string; name: string }>;
   onCancel: () => void;
   onCreate: (edits: PlanEdit[]) => void;
 }) {
   const [goal, setGoal] = useState('');
-  const [assignee, setAssignee] = useState('deepseek-v3');
+  const [details, setDetails] = useState('');
+  const [assignee, setAssignee] = useState(agents[0]?.id ?? 'deepseek-v4-flash');
   const [inputs, setInputs] = useState<string[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [suggestion, setSuggestion] = useState<{ reasoning?: string } | null>(null);
@@ -382,6 +443,7 @@ function NewTaskForm({
         task: {
           id,
           goal: goal.trim(),
+          details: details.trim() || undefined,
           assigneeAgentId: assignee || undefined,
           inputs,
           acceptance: [{ kind: 'manual' }],
@@ -417,14 +479,21 @@ function NewTaskForm({
         onChange={(e) => setGoal(e.target.value)}
         className="w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-emerald-400"
       />
+      <textarea
+        placeholder="细节说明：任务边界、输入输出、验收重点"
+        value={details}
+        onChange={(e) => setDetails(e.target.value)}
+        rows={3}
+        className="w-full resize-none rounded bg-bg/60 px-2 py-1 text-xs outline-none focus:ring-1 focus:ring-emerald-400"
+      />
       <select
         value={assignee}
         onChange={(e) => setAssignee(e.target.value)}
         className="w-full rounded bg-bg/60 px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-emerald-400"
       >
-        {AGENTS.map((a) => (
-          <option key={a} value={a}>
-            {AGENT_NAME[a]} ({a})
+        {agents.map((a) => (
+          <option key={a.id} value={a.id}>
+            {a.name} ({a.id})
           </option>
         ))}
       </select>

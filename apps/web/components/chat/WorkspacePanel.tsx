@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { File, Folder, RefreshCw, TerminalSquare } from 'lucide-react';
+import { File, Folder, Play, RefreshCw, Save, TerminalSquare } from 'lucide-react';
 import clsx from 'clsx';
 import { useConversationStore } from '@/lib/store';
 
@@ -26,13 +26,29 @@ interface WorkspaceReadResult {
   sha256: string;
 }
 
+interface TerminalRunResult {
+  command: string;
+  cwd: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+  truncated: boolean;
+}
+
 export function WorkspacePanel() {
   const activeId = useConversationStore((s) => s.activeId);
   const [list, setList] = useState<WorkspaceListResult | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selected, setSelected] = useState<WorkspaceReadResult | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [command, setCommand] = useState('');
+  const [terminal, setTerminal] = useState<TerminalRunResult | null>(null);
+  const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const dirty = selected !== null && draft !== selected.content;
 
   const refresh = useCallback(async () => {
     if (!activeId) return;
@@ -74,9 +90,57 @@ export function WorkspacePanel() {
         ),
       );
       if (!res.ok) throw new Error(`read ${res.status}: ${await res.text()}`);
-      setSelected((await res.json()) as WorkspaceReadResult);
+      const file = (await res.json()) as WorkspaceReadResult;
+      setSelected(file);
+      setDraft(file.content);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const saveFile = async () => {
+    if (!activeId || !selected) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        apiUrl(`/api/conversations/${encodeURIComponent(activeId)}/workspace/file`),
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: selected.path, content: draft }),
+        },
+      );
+      if (!res.ok) throw new Error(`save ${res.status}: ${await res.text()}`);
+      await openFile(selected.path);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const runCommand = async () => {
+    if (!activeId || !command.trim() || running) return;
+    setRunning(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        apiUrl(`/api/conversations/${encodeURIComponent(activeId)}/workspace/terminal`),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: command.trim(), timeoutMs: 30000 }),
+        },
+      );
+      if (!res.ok) throw new Error(`terminal ${res.status}: ${await res.text()}`);
+      setTerminal((await res.json()) as TerminalRunResult);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning(false);
     }
   };
 
@@ -146,19 +210,71 @@ export function WorkspacePanel() {
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-white/5 bg-bg-soft/40">
-        <div className="border-b border-white/5 px-2 py-1.5 font-mono text-[10px] text-text-muted">
-          {selected?.path ?? 'Select a file'}
+        <div className="flex items-center gap-2 border-b border-white/5 px-2 py-1.5">
+          <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-text-muted">
+            {selected?.path ?? 'Select a file'}
+            {dirty ? ' *' : ''}
+          </span>
+          {selected ? (
+            <button
+              onClick={() => void saveFile()}
+              disabled={!dirty || saving}
+              className="flex items-center gap-1 rounded bg-accent px-2 py-1 text-[10px] text-white hover:bg-accent-hover disabled:opacity-40"
+            >
+              <Save className="h-3 w-3" />
+              {saving ? 'Saving' : 'Save'}
+            </button>
+          ) : null}
         </div>
         {selected ? (
-          <pre className="min-h-0 flex-1 overflow-auto p-3 font-mono text-[11px] leading-relaxed text-text whitespace-pre-wrap">
-            {selected.content}
-            {selected.truncated ? '\n\n/* truncated */' : ''}
-          </pre>
+          <textarea
+            value={draft + (selected.truncated ? '\n\n/* truncated */' : '')}
+            onChange={(e) => setDraft(selected.truncated ? draft : e.target.value)}
+            readOnly={selected.truncated}
+            spellCheck={false}
+            className="min-h-0 flex-1 resize-none overflow-auto bg-transparent p-3 font-mono text-[11px] leading-relaxed text-text outline-none"
+          />
         ) : (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-text-muted">
             File content from agent-written workspace will render here.
           </div>
         )}
+      </div>
+
+      <div className="rounded-md border border-white/5 bg-bg-soft/40">
+        <div className="flex items-center gap-2 border-b border-white/5 px-2 py-1.5 text-[10px] uppercase tracking-wider text-text-muted">
+          <TerminalSquare className="h-3.5 w-3.5" />
+          Terminal
+        </div>
+        <div className="space-y-2 p-2">
+          <div className="flex gap-1">
+            <input
+              value={command}
+              onChange={(e) => setCommand(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void runCommand();
+              }}
+              placeholder="npm test / pnpm build / ls"
+              className="min-w-0 flex-1 rounded bg-bg/60 px-2 py-1 font-mono text-[11px] outline-none focus:ring-1 focus:ring-accent"
+            />
+            <button
+              onClick={() => void runCommand()}
+              disabled={!command.trim() || running}
+              className="flex items-center gap-1 rounded bg-white/10 px-2 py-1 text-[11px] text-text hover:bg-white/15 disabled:opacity-40"
+            >
+              <Play className={clsx('h-3 w-3', running && 'animate-pulse')} />
+              Run
+            </button>
+          </div>
+          {terminal ? (
+            <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-text-muted whitespace-pre-wrap">
+              {`$ ${terminal.command}\nexit ${terminal.exitCode ?? 'null'}${terminal.timedOut ? ' (timeout)' : ''}\n\n`}
+              {terminal.stdout}
+              {terminal.stderr ? `\n[stderr]\n${terminal.stderr}` : ''}
+              {terminal.truncated ? '\n\n[output truncated]' : ''}
+            </pre>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -166,7 +282,10 @@ export function WorkspacePanel() {
 
 function apiUrl(path: string): string {
   if (typeof window === 'undefined') return `http://localhost:4000${path}`;
-  return `http://${window.location.hostname}:4000${path}`;
+  const hostname = window.location.hostname.includes(':')
+    ? `[${window.location.hostname}]`
+    : window.location.hostname;
+  return `${window.location.protocol}//${hostname}:4000${path}`;
 }
 
 function formatBytes(n: number): string {

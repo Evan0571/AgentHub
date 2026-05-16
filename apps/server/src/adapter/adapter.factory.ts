@@ -29,7 +29,7 @@ export interface ResolvedAgentSpec {
   agentId: string;
   /** Provider type. */
   adapterId: string;
-  /** Model id at the provider (e.g. `gpt-4o`, `deepseek-chat`). */
+  /** Model id at the provider (e.g. `gpt-4o`, `deepseek-v4-flash`). */
   model: string | null;
   /** Plaintext API key (already decrypted) or null to use env default. */
   apiKey: string | null;
@@ -91,20 +91,34 @@ export class AdapterFactoryService {
         raw = new MockAdapter();
         break;
 
+      // NOTE: `deepseek-v4-flash` / `deepseek-v4-pro` are our internal adapter
+      // ids / UI labels, NOT DeepSeek API model names. The real api.deepseek.com
+      // models are `deepseek-chat` (fast) and `deepseek-reasoner` (reasoning).
+      // Sending the label as `model` makes the API 400 "Model Not Exist", so
+      // `resolveDeepSeekModel` normalizes whatever is stored (incl. legacy
+      // conv-agent rows that saved the label) back to a real model name.
+      case 'deepseek-v4-flash':
       case 'deepseek-v3':
       case 'deepseek':
         raw = new DeepSeekAdapter({
           apiKey: apiKey!,
-          model: spec.model ?? 'deepseek-chat',
+          model: resolveDeepSeekModel(
+            spec.model,
+            process.env.DEEPSEEK_FAST_MODEL ?? 'deepseek-chat',
+          ),
           baseURL: spec.baseUrl ?? undefined,
           id: spec.agentId,
         });
         break;
 
+      case 'deepseek-v4-pro':
       case 'deepseek-r1':
         raw = new DeepSeekAdapter({
           apiKey: apiKey!,
-          model: spec.model ?? 'deepseek-reasoner',
+          model: resolveDeepSeekModel(
+            spec.model,
+            process.env.DEEPSEEK_REASONING_MODEL ?? 'deepseek-reasoner',
+          ),
           baseURL: spec.baseUrl ?? undefined,
           id: spec.agentId,
         });
@@ -150,6 +164,8 @@ export class AdapterFactoryService {
 
   private defaultEnvKey(adapterId: string): string | undefined {
     switch (adapterId) {
+      case 'deepseek-v4-flash':
+      case 'deepseek-v4-pro':
       case 'deepseek-v3':
       case 'deepseek-r1':
       case 'deepseek':
@@ -169,4 +185,21 @@ export class AdapterFactoryService {
         return undefined;
     }
   }
+}
+
+/**
+ * Map whatever DeepSeek "model" got stored (UI label, legacy adapter id, or a
+ * real API name) onto an actual api.deepseek.com model. Unknown values that
+ * look like genuine custom models are passed through unchanged so a真·custom
+ * deployment still works.
+ */
+function resolveDeepSeekModel(stored: string | null, fallback: string): string {
+  const v = (stored ?? '').trim().toLowerCase();
+  if (!v) return fallback;
+  const FAST = new Set(['deepseek-v4-flash', 'deepseek-v3', 'deepseek', 'deepseek-chat', 'v4-flash', 'flash']);
+  const REASON = new Set(['deepseek-v4-pro', 'deepseek-r1', 'deepseek-reasoner', 'v4-pro', 'pro', 'reasoner']);
+  if (FAST.has(v)) return 'deepseek-chat';
+  if (REASON.has(v)) return 'deepseek-reasoner';
+  // Looks like a real, deliberately-set model id → trust it.
+  return stored!.trim();
 }

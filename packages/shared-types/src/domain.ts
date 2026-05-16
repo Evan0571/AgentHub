@@ -3,6 +3,14 @@
 export type ID = string;
 export type ISODateTime = string;
 
+/**
+ * Synthetic mention that routes a message to the project Orchestrator/Planner
+ * instead of a single agent. Not a real agent row — both the web client
+ * (intent inference) and the server (mention router) special-case it, so it
+ * lives here to stay in sync.
+ */
+export const PROJECT_PLANNER_MENTION = 'project-planner';
+
 export type ConversationType = 'single' | 'group';
 
 export interface Conversation {
@@ -36,13 +44,22 @@ export interface AgentProfile {
 export type SenderType = 'user' | 'agent' | 'system';
 
 export type MessageContent =
-  | { kind: 'text'; text: string }
+  | { kind: 'text'; text: string; attachments?: MessageAttachment[] }
   | { kind: 'code'; lang: string; code: string }
   | { kind: 'diff'; snapshotId: ID; summary: string }
   | { kind: 'plan'; planId: ID }
   | { kind: 'preview'; sandboxId: ID; url: string; shareUrl?: string }
   | { kind: 'deploy'; deploymentId: ID; url: string; status: DeployStatus }
   | { kind: 'system'; severity: 'info' | 'warn' | 'error'; text: string };
+
+export interface MessageAttachment {
+  id: ID;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  kind: 'image' | 'text' | 'file';
+}
 
 export interface Message {
   id: ID;

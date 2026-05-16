@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react';
 import clsx from 'clsx';
 import { Eye, EyeOff, KeyRound, Loader2, Lock, Pencil, Plus, Trash2 } from 'lucide-react';
-import { isHiddenSystemAgentId, useConversationStore, type AgentProfile } from '@/lib/store';
+import { isConversationScopedAgentId, isHiddenSystemAgentId, useConversationStore, type AgentProfile } from '@/lib/store';
 import { ModalShell } from './NewConversationDialog';
 import { prettifyApiError } from '@/lib/api-errors';
 import { AgentAvatar } from '../AgentAvatar';
@@ -28,14 +28,14 @@ interface Provider {
 
 const PROVIDERS: Provider[] = [
   {
-    id: 'deepseek-v3',
+    id: 'deepseek',
     label: 'DeepSeek',
-    hint: '通用 / 推理 — OpenAI 兼容协议',
+    hint: 'V4 Flash / V4 Pro · 强推理 · OpenAI 兼容',
     requiresOwnKey: false,
     hasBaseUrl: false,
     models: [
-      { id: 'deepseek-chat', label: 'DeepSeek V3', hint: '通用 · 快 · 便宜' },
-      { id: 'deepseek-reasoner', label: 'DeepSeek R1', hint: '复杂推理 · 思考链' },
+      { id: 'deepseek-v4-flash', label: 'DeepSeek V4 Flash', hint: '默认 · 快 · 很便宜 · 支持思考' },
+      { id: 'deepseek-v4-pro', label: 'DeepSeek V4 Pro', hint: '更强 · 规划/复杂推理' },
     ],
   },
   {
@@ -102,13 +102,21 @@ const PROVIDERS: Provider[] = [
 const VISIBLE_PROVIDERS = PROVIDERS.filter((p) => p.id !== 'mock');
 
 function findProvider(adapterId: string): Provider {
+  if (
+    adapterId === 'deepseek-v4-flash' ||
+    adapterId === 'deepseek-v4-pro' ||
+    adapterId === 'deepseek-v3' ||
+    adapterId === 'deepseek-r1'
+  ) {
+    return PROVIDERS.find((p) => p.id === 'deepseek') ?? PROVIDERS[0]!;
+  }
   return PROVIDERS.find((p) => p.id === adapterId) ?? PROVIDERS[0]!;
 }
 
 const AVATAR_PALETTE = [
-  '#6366f1', '#4f46e5', '#7c3aed', '#a855f7', '#ec4899',
-  '#ef4444', '#f97316', '#eab308', '#10b981', '#14b8a6',
-  '#0ea5e9', '#6b7280',
+  '#0f766e', '#14b8a6', '#0891b2', '#0ea5e9', '#2563eb',
+  '#475569', '#16a34a', '#ca8a04', '#f97316', '#dc2626',
+  '#db2777', '#6b7280',
 ];
 
 const ROLE_PRESETS: Array<{ id: string; name: string; description: string; systemPrompt: string }> = [
@@ -213,7 +221,7 @@ export function ManageAgentsModal({ onClose }: { onClose: () => void }) {
 
   const sorted = useMemo(
     () =>
-      agents.filter((a) => !isHiddenSystemAgentId(a.id)).sort((a, b) => {
+      agents.filter((a) => !isHiddenSystemAgentId(a.id) && !isConversationScopedAgentId(a.id)).sort((a, b) => {
         if (a.isPublic !== b.isPublic) return a.isPublic ? -1 : 1;
         return a.name.localeCompare(b.name);
       }),
@@ -367,7 +375,7 @@ function AgentForm({
   onSubmit: (data: FormData) => Promise<void>;
 }) {
   const [name, setName] = useState(initial?.name ?? '');
-  const [providerId, setProviderId] = useState(initial?.adapterId ?? 'deepseek-v3');
+  const [providerId, setProviderId] = useState(initial?.adapterId ? findProvider(initial.adapterId).id : 'deepseek');
   const provider = findProvider(providerId);
 
   const [model, setModel] = useState<string>(
@@ -410,7 +418,10 @@ function AgentForm({
     try {
       const payload: FormData = {
         name: name.trim(),
-        adapterId: providerId,
+        adapterId:
+          providerId === 'deepseek' && (model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro')
+            ? model
+            : providerId,
         systemPrompt: systemPrompt.trim(),
         avatarColor,
         model: model || null,

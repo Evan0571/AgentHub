@@ -15,8 +15,9 @@ import { AdapterError, mapHttpStatus } from '@agenthub/adapter-core';
 /**
  * DeepSeekAdapter — talks the OpenAI-compatible Chat Completions API
  * at https://api.deepseek.com. Supported models:
- *   - deepseek-chat     (DeepSeek V3, general purpose)
- *   - deepseek-reasoner (DeepSeek R1, emits reasoning_content)
+ *   - deepseek-v4-flash (fast, low-cost, default for general work)
+ *   - deepseek-v4-pro   (stronger reasoning, default for planning/risk roles)
+ *   - deepseek-chat / deepseek-reasoner are legacy compatibility aliases
  *
  * Why we map to native fetch instead of the openai SDK:
  *   - zero extra deps for the package
@@ -24,19 +25,26 @@ import { AdapterError, mapHttpStatus } from '@agenthub/adapter-core';
  *     which the OpenAI SDK does not type today
  */
 
-export type DeepSeekModel = 'deepseek-chat' | 'deepseek-reasoner' | (string & {});
+export type DeepSeekModel =
+  | 'deepseek-v4-flash'
+  | 'deepseek-v4-pro'
+  | 'deepseek-chat'
+  | 'deepseek-reasoner'
+  | (string & {});
 
 export interface DeepSeekAdapterOptions {
   apiKey: string;
   model: DeepSeekModel;
   baseURL?: string;
-  /** Override the adapter id, useful when registering V3 + R1 side-by-side. */
+  /** Override the adapter id, useful when registering fast + reasoning adapters side-by-side. */
   id?: string;
   displayName?: string;
 }
 
-// USD per 1M tokens; rough public rates as of 2026 — adjust if pricing changes.
+// USD per 1M tokens; DeepSeek publishes CNY rates, converted roughly at 1 CNY ~= 0.14 USD.
 const PRICING: Record<string, { in: number; out: number }> = {
+  'deepseek-v4-flash': { in: 0.14, out: 0.28 },
+  'deepseek-v4-pro': { in: 0.42, out: 0.84 },
   'deepseek-chat': { in: 0.27, out: 1.1 },
   'deepseek-reasoner': { in: 0.55, out: 2.19 },
 };
@@ -56,31 +64,51 @@ export class DeepSeekAdapter implements AgentAdapter {
     this.apiKey = opts.apiKey;
     this.model = opts.model;
     this.baseURL = (opts.baseURL ?? 'https://api.deepseek.com').replace(/\/+$/, '');
-    this.id = opts.id ?? (opts.model === 'deepseek-reasoner' ? 'deepseek-r1' : 'deepseek-v3');
+    this.id =
+      opts.id ??
+      (opts.model === 'deepseek-v4-pro'
+        ? 'deepseek-v4-pro'
+        : opts.model === 'deepseek-v4-flash'
+          ? 'deepseek-v4-flash'
+          : opts.model === 'deepseek-reasoner'
+            ? 'deepseek-r1'
+            : 'deepseek-v3');
     this.displayName =
-      opts.displayName ?? (opts.model === 'deepseek-reasoner' ? 'DeepSeek R1' : 'DeepSeek V3');
+      opts.displayName ??
+      (opts.model === 'deepseek-v4-pro'
+        ? 'DeepSeek V4 Pro'
+        : opts.model === 'deepseek-v4-flash'
+          ? 'DeepSeek V4 Flash'
+          : opts.model === 'deepseek-reasoner'
+            ? 'DeepSeek R1'
+            : 'DeepSeek V3');
 
     const isReasoner = opts.model === 'deepseek-reasoner';
     this.capabilities = {
       streaming: true,
-      // R1 currently does NOT support function/tool calls.
+      // Legacy R1 alias does not support function/tool calls. V4 models do.
       toolUse: !isReasoner,
       codeExecution: false,
       fileEdit: true,        // emulated via prompt + file_patch tool
       webBrowse: false,
-      maxContextTokens: 64_000,
+      maxContextTokens: opts.model.startsWith('deepseek-v4') ? 1_000_000 : 64_000,
       supportedLangs: ['zh', 'en'],
     };
   }
 
   async *chat(req: ChatRequest, signal?: AbortSignal): AsyncIterable<ChatEvent> {
     const t0 = Date.now();
+    const toolUseEnabled = !!req.tools?.length && this.capabilities.toolUse;
+    const thinkingEnabled = isDeepSeekV4(this.model) && !toolUseEnabled;
     const body = {
       model: this.model,
       messages: this.translateMessages(req.systemPrompt, req.messages),
       stream: true,
-      ...(req.tools?.length && this.capabilities.toolUse
-        ? { tools: toOpenAITools(req.tools), tool_choice: 'auto' as const }
+      ...(isDeepSeekV4(this.model)
+        ? { thinking: { type: thinkingEnabled ? 'enabled' : 'disabled' } }
+        : {}),
+      ...(toolUseEnabled
+        ? { tools: toOpenAITools(req.tools ?? []), tool_choice: 'auto' as const }
         : {}),
       ...(req.budget?.maxTokens ? { max_tokens: req.budget.maxTokens } : {}),
     };
@@ -211,7 +239,7 @@ export class DeepSeekAdapter implements AgentAdapter {
 
   estimateCost(req: ChatRequest): CostEstimate {
     const promptTokens = roughTokens(req);
-    const p = PRICING[this.model] ?? PRICING['deepseek-chat']!;
+    const p = PRICING[this.model] ?? PRICING['deepseek-v4-flash']!;
     return { estimatedCostUsd: (promptTokens / 1_000_000) * p.in, promptTokens };
   }
 
@@ -339,6 +367,10 @@ function roughTokens(req: ChatRequest): number {
 }
 
 function estimateCost(model: string, promptTokens: number, completionTokens: number): number {
-  const p = PRICING[model] ?? PRICING['deepseek-chat']!;
+  const p = PRICING[model] ?? PRICING['deepseek-v4-flash']!;
   return (promptTokens / 1_000_000) * p.in + (completionTokens / 1_000_000) * p.out;
+}
+
+function isDeepSeekV4(model: string): boolean {
+  return model === 'deepseek-v4-flash' || model === 'deepseek-v4-pro';
 }

@@ -303,5 +303,8 @@ function SandboxFrame({
 
 function apiUrl(path: string): string {
   if (typeof window === 'undefined') return `http://localhost:4000${path}`;
-  return `http://${window.location.hostname}:4000${path}`;
+  const hostname = window.location.hostname.includes(':')
+    ? `[${window.location.hostname}]`
+    : window.location.hostname;
+  return `${window.location.protocol}//${hostname}:4000${path}`;
 }

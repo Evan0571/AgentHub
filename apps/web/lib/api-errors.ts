@@ -91,7 +91,7 @@ export function prettifyApiError(input: Error | string, fallback = '操作失败
   if (status === 429) return '请求过于频繁，稍后再试';
   if (status && status >= 500) return `服务端错误 ${status} — 看 server 控制台日志`;
   if (/fetch failed|NetworkError|Failed to fetch/i.test(body)) {
-    return '连不上服务端 — 确认 server 是否在 4000 端口运行';
+    return '请求被浏览器拦下 — server 没在 4000 跑，或你访问 UI 的地址不在 CORS 白名单（试试用 http://localhost:3000 打开）';
   }
 
   return fallback + (status ? `（${status}）` : '');

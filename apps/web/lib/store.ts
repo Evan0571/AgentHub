@@ -1,7 +1,7 @@
 'use client';
 
 import { create } from 'zustand';
-import type { ServerEvent, Plan, PlanEdit } from '@agenthub/shared-types';
+import { type ServerEvent, type Plan, type PlanEdit, type MessageAttachment, PROJECT_PLANNER_MENTION } from '@agenthub/shared-types';
 import { AgentHubWS } from './ws-client';
 
 export interface ChatMessage {
@@ -9,10 +9,11 @@ export interface ChatMessage {
   conversationId: string;
   senderName: string;
   senderType: 'user' | 'agent' | 'system';
-  /** Underlying provider (e.g. `deepseek-v3`, `codex`) — drives the brand logo avatar. */
+  /** Underlying provider (e.g. `deepseek-v4-flash`, `codex`) — drives the brand logo avatar. */
   adapterId?: string;
   avatarColor?: string;
   text: string;
+  attachments?: MessageAttachment[];
   thinking?: string;
   streaming?: boolean;
   createdAt: string;
@@ -36,6 +37,23 @@ export const HIDDEN_SYSTEM_AGENT_IDS = new Set(['mock', 'orchestrator']);
 
 export function isHiddenSystemAgentId(id: string): boolean {
   return HIDDEN_SYSTEM_AGENT_IDS.has(id);
+}
+
+export function isConversationScopedAgentId(id: string): boolean {
+  return id.startsWith('conv-agent-');
+}
+
+/**
+ * conv-agent ids look like `conv-agent-<36charUUID>-<baseRoleId>`. The base
+ * role agent (e.g. `solution-architect`) is a public seeded agent that IS in
+ * the client list, so we can borrow its display name/color even though the
+ * per-conversation clone isn't fetched into `state.agents`.
+ */
+export function baseRoleIdFromConvAgent(id: string): string | null {
+  if (!id.startsWith('conv-agent-')) return null;
+  const rest = id.slice('conv-agent-'.length);
+  const m = /^[0-9a-fA-F-]{36}-(.+)$/.exec(rest);
+  return m?.[1] ?? null;
 }
 
 export interface ChatConversation {
@@ -88,7 +106,7 @@ interface State {
    * so the user still sees a working app.
    */
   openPreview: (blockUid: string, opts?: { setEntry?: boolean }) => void;
-  sendUserMessage: (conversationId: string, text: string) => void;
+  sendUserMessage: (conversationId: string, text: string, attachments?: MessageAttachment[]) => void;
   /** Apply plan edits with optimistic concurrency (baseVersion). Server is authoritative. */
   editPlan: (planId: string, edits: PlanEdit[]) => void;
   /** Request AI-suggested deps for a new task; returns a promise. */
@@ -110,6 +128,13 @@ interface State {
     type: 'single' | 'group';
     title: string;
     memberAgentIds: string[];
+    memberConfigs?: Array<{
+      roleAgentId: string;
+      adapterId: string;
+      model?: string | null;
+      skills?: Array<{ id: string; label: string; prompt: string }>;
+      customSkills?: string | null;
+    }>;
     groupSystemPrompt?: string | null;
   }) => Promise<ChatConversation>;
   deleteConversation: (id: string) => Promise<void>;
@@ -156,7 +181,10 @@ const pendingSuggestions = new Map<
 /** Server hostname for REST API. WS uses the same host on port 4000. */
 function apiUrl(path: string): string {
   if (typeof window === 'undefined') return `http://localhost:4000${path}`;
-  return `http://${window.location.hostname}:4000${path}`;
+  const hostname = window.location.hostname.includes(':')
+    ? `[${window.location.hostname}]`
+    : window.location.hostname;
+  return `${window.location.protocol}//${hostname}:4000${path}`;
 }
 
 /** Track which conversations have completed initial hydration to avoid refetches. */
@@ -171,16 +199,25 @@ const hydratingConvs = new Set<string>();
  */
 const AGENT_PROFILE_FALLBACK: Record<string, { name: string; color: string; adapterId?: string }> = {
   system: { name: 'System', color: '#6b7280' },
-  me: { name: '我', color: '#6366f1' },
-  orchestrator: { name: 'Orchestrator', color: '#f97316', adapterId: 'orchestrator' },
+  me: { name: '我', color: '#0f766e' },
+  orchestrator: { name: '项目流程', color: '#f97316', adapterId: 'orchestrator' },
 };
 
 function lookupAgentProfile(
   senderId: string,
   agents: AgentProfile[],
 ): { name: string; color: string; adapterId?: string } {
+  if (isHiddenSystemAgentId(senderId)) {
+    return AGENT_PROFILE_FALLBACK[senderId] ?? { name: '系统流程', color: '#9ca3af' };
+  }
   const a = agents.find((x) => x.id === senderId);
   if (a) return { name: a.name, color: a.avatarColor, adapterId: a.adapterId };
+  // conv-scoped clones aren't in the fetched list — resolve via base role.
+  const baseRoleId = baseRoleIdFromConvAgent(senderId);
+  if (baseRoleId) {
+    const base = agents.find((x) => x.id === baseRoleId);
+    if (base) return { name: base.name, color: base.avatarColor, adapterId: base.adapterId };
+  }
   return AGENT_PROFILE_FALLBACK[senderId] ?? { name: senderId, color: '#9ca3af' };
 }
 
@@ -199,7 +236,7 @@ export const EMPTY_DEPLOYMENTS: readonly Deployment[] = Object.freeze([]);
 
 /**
  * Map a ConversationSummary from the server into our store shape. Picks a
- * sensible targetAgentId for single chats (the only non-orchestrator member).
+ * sensible targetAgentId for single chats (the first visible member).
  */
 function fromServerConv(c: {
   id: string;
@@ -216,7 +253,7 @@ function fromServerConv(c: {
 }): ChatConversation {
   const targetAgentId =
     c.type === 'single'
-      ? c.members.find((m) => m.agentId !== 'orchestrator')?.agentId
+      ? c.members.find((m) => !isHiddenSystemAgentId(m.agentId))?.agentId
       : undefined;
   return {
     id: c.id,
@@ -226,6 +263,109 @@ function fromServerConv(c: {
     members: c.members,
     targetAgentId,
   };
+}
+
+function inferMentions(conv: ChatConversation | undefined, text: string): string[] {
+  if (!conv) return ['deepseek-v4-flash'];
+
+  const memberIds = new Set(conv.members.map((m) => m.agentId));
+  const explicit = new Set<string>();
+  for (const m of text.matchAll(/@([\w-]+)/g)) {
+    const id = m[1];
+    if (id && memberIds.has(id) && !isHiddenSystemAgentId(id)) explicit.add(id);
+  }
+  if (explicit.size > 0) return [...explicit];
+
+  if (conv.type !== 'group') {
+    const fallbackMember = conv.members.find((m) => !isHiddenSystemAgentId(m.agentId)) ?? conv.members[0];
+    const defaultSingleAgent =
+      conv.targetAgentId && !isHiddenSystemAgentId(conv.targetAgentId)
+        ? conv.targetAgentId
+        : fallbackMember?.agentId;
+    return [defaultSingleAgent ?? 'deepseek-v4-flash'];
+  }
+
+  const normalized = text.toLowerCase();
+  const has = (patterns: RegExp[]) => patterns.some((re) => re.test(normalized));
+  const pick = (ids: string[], namePattern?: RegExp): string | undefined => {
+    for (const id of ids) {
+      if (memberIds.has(id) && !isHiddenSystemAgentId(id)) return id;
+    }
+    if (namePattern) {
+      const member = conv.members.find((m) =>
+        !isHiddenSystemAgentId(m.agentId) && namePattern.test(`${m.name} ${m.agentId} ${m.adapterId}`),
+      );
+      return member?.agentId;
+    }
+    return undefined;
+  };
+
+  // Only hand off to the project planner when it's clearly a *whole-project*
+  // ask. Previously a single "实现登录接口" hijacked the route because any one
+  // of three loose groups matched. Now we require either:
+  //   (a) an action verb co-occurring with a project-scope noun
+  //       ("做一个待办应用"、"搭建一个电商系统"), or
+  //   (b) an explicit planning / breakdown request ("帮我拆解一下任务").
+  // Single-component requests ("写个登录接口") fall through to role routing.
+  const actionVerb =
+    /做一个|做个|搭一个|搭个|写一个|创建|生成|开发|实现|搭建|构建|build|create|implement|make/;
+  const projectScope =
+    /项目|应用|app|网站|网页|系统|平台|产品|端到端|全栈|full[ -]?stack|project|website|dashboard|platform/;
+  const planningAsk =
+    /拆解|拆分|任务拆|帮我规划|做个规划|项目计划|计划任务|分工|排期|roadmap|break ?down|plan the/;
+  const projectIntent =
+    (actionVerb.test(normalized) && projectScope.test(normalized)) ||
+    planningAsk.test(normalized);
+  if (projectIntent) return [PROJECT_PLANNER_MENTION];
+
+  const roleRoutes: Array<{ patterns: RegExp[]; ids: string[]; name?: RegExp }> = [
+    {
+      patterns: [/前端|界面|ui|ux|页面|组件|样式|css|react|next|动画|preview/],
+      ids: ['frontend-engineer'],
+      name: /前端|frontend|ui/i,
+    },
+    {
+      patterns: [/后端|接口|api|数据库|鉴权|登录|服务端|server|backend|db|auth/],
+      ids: ['backend-engineer'],
+      name: /后端|backend|server/i,
+    },
+    {
+      patterns: [/测试|验证|报错|失败|bug|修复|typecheck|compile|build error|不能运行/],
+      ids: ['qa-tester', 'code-reviewer'],
+      name: /测试|qa|review/i,
+    },
+    {
+      patterns: [/review|审查|代码质量|风险|安全|边界|隐私|漏洞|critic/],
+      ids: ['risk-critic', 'code-reviewer'],
+      name: /风险|review|critic|审查/i,
+    },
+    {
+      patterns: [/部署|环境|terminal|命令|脚本|docker|vercel|env|ci/],
+      ids: ['env-engineer'],
+      name: /环境|devops|部署/i,
+    },
+    {
+      patterns: [/产品|需求|用户|体验|文案|验收|范围|prd/],
+      ids: ['product-analyst', 'senior-user'],
+      name: /产品|用户|analyst|user/i,
+    },
+    {
+      patterns: [/架构|设计|方案|技术选型|模块|数据流|architecture/],
+      ids: ['solution-architect'],
+      name: /架构|architect/i,
+    },
+  ];
+
+  for (const route of roleRoutes) {
+    if (!has(route.patterns)) continue;
+    const id = pick(route.ids, route.name);
+    if (id) return [id];
+  }
+
+  const architect = pick(['solution-architect'], /架构|architect/i);
+  if (architect) return [architect];
+  const firstVisible = conv.members.find((m) => !isHiddenSystemAgentId(m.agentId));
+  return [firstVisible?.agentId ?? 'deepseek-v4-flash'];
 }
 
 export const useConversationStore = create<State>((set, get) => ({
@@ -306,6 +446,7 @@ export const useConversationStore = create<State>((set, get) => ({
           senderType: 'user' | 'agent' | 'system';
           senderId: string;
           text: string;
+          attachments?: MessageAttachment[];
           createdAt: string;
         }>;
         plan: Plan | null;
@@ -314,7 +455,7 @@ export const useConversationStore = create<State>((set, get) => ({
       const msgs: ChatMessage[] = data.messages.map((m) => {
         const profile =
           m.senderType === 'user'
-            ? { name: '我', color: '#6366f1', adapterId: undefined as string | undefined }
+            ? { name: '我', color: '#0f766e', adapterId: undefined as string | undefined }
             : lookupAgentProfile(m.senderId, agents);
         return {
           id: m.id,
@@ -324,6 +465,7 @@ export const useConversationStore = create<State>((set, get) => ({
           adapterId: profile.adapterId,
           avatarColor: profile.color,
           text: m.text,
+          attachments: m.attachments,
           createdAt: m.createdAt,
         };
       });
@@ -343,9 +485,17 @@ export const useConversationStore = create<State>((set, get) => ({
 
   ensureConnected: () => {
     if (get().ws) return;
+    const hostname =
+      typeof window !== 'undefined' && window.location.hostname.includes(':')
+        ? `[${window.location.hostname}]`
+        : typeof window !== 'undefined'
+          ? window.location.hostname
+          : 'localhost';
+    const wsProtocol =
+      typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url =
       typeof window !== 'undefined'
-        ? `ws://${window.location.hostname}:4000/ws`
+        ? `${wsProtocol}//${hostname}:4000/ws`
         : 'ws://localhost:4000/ws';
     const ws = new AgentHubWS(url);
     ws.subscribe((ev) => handleServerEvent(ev, set, get));
@@ -353,16 +503,18 @@ export const useConversationStore = create<State>((set, get) => ({
     set({ ws });
   },
 
-  sendUserMessage: (conversationId, text) => {
+  sendUserMessage: (conversationId, text, attachments) => {
     get().ensureConnected();
     const conv = get().conversations.find((c) => c.id === conversationId);
+    const safeAttachments = attachments?.length ? attachments : undefined;
     const userMsg: ChatMessage = {
       id: 'u' + Date.now(),
       conversationId,
       senderType: 'user',
       senderName: '我',
-      avatarColor: '#6366f1',
+      avatarColor: '#0f766e',
       text,
+      attachments: safeAttachments,
       createdAt: new Date().toISOString(),
     };
     set((s) => ({
@@ -371,29 +523,11 @@ export const useConversationStore = create<State>((set, get) => ({
         [conversationId]: [...(s.messagesByConv[conversationId] ?? []), userMsg],
       },
     }));
-    // Pull @agent-id mentions from the text and intersect with conversation members.
-    // Fall back to the conversation's default target (single-chat) or first member.
-    const memberIds = new Set(conv?.members.map((m) => m.agentId) ?? []);
-    const found = new Set<string>();
-    for (const m of text.matchAll(/@([\w-]+)/g)) {
-      const id = m[1];
-      if (id && (id === 'orchestrator' || memberIds.has(id))) found.add(id);
-    }
-    const fallbackMember = conv?.members.find((m) => !isHiddenSystemAgentId(m.agentId)) ?? conv?.members[0];
-    const defaultSingleAgent =
-      conv?.targetAgentId && !isHiddenSystemAgentId(conv.targetAgentId)
-        ? conv.targetAgentId
-        : fallbackMember?.agentId;
-    const mentions =
-      found.size > 0
-        ? [...found]
-        : conv?.type === 'group'
-          ? ['orchestrator']
-          : [defaultSingleAgent ?? 'deepseek-v3'];
+    const mentions = inferMentions(conv, text);
     get().ws!.send({
       op: 'user_msg',
       conversationId,
-      content: { kind: 'text', text },
+      content: { kind: 'text', text, ...(safeAttachments ? { attachments: safeAttachments } : {}) },
       mentions,
     });
   },
@@ -455,6 +589,7 @@ export const useConversationStore = create<State>((set, get) => ({
       return {
         conversations: next,
         activeId: s.activeId === id ? next[0]?.id ?? null : s.activeId,
+        agents: s.agents.filter((a) => !a.id.startsWith(`conv-agent-${id}-`)),
       };
     });
   },

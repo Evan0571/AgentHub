@@ -27,6 +27,8 @@ type LobeIcon = ComponentType<{ color?: string; size?: number | string }>;
 
 const BRAND: Record<string, { Icon: LobeIcon; label: string }> = {
   deepseek: { Icon: DeepSeek as LobeIcon, label: 'DeepSeek' },
+  'deepseek-v4-flash': { Icon: DeepSeek as LobeIcon, label: 'DeepSeek' },
+  'deepseek-v4-pro': { Icon: DeepSeek as LobeIcon, label: 'DeepSeek' },
   'deepseek-v3': { Icon: DeepSeek as LobeIcon, label: 'DeepSeek' },
   'deepseek-r1': { Icon: DeepSeek as LobeIcon, label: 'DeepSeek' },
   openai: { Icon: OpenAI as LobeIcon, label: 'OpenAI' },

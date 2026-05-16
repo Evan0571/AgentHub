@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { open, mkdir, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
@@ -122,8 +122,13 @@ export class WorkspaceService {
 
   async readFile(conversationId: string, input: { path: string; maxBytes?: number }): Promise<WorkspaceReadResult> {
     const abs = this.resolveInside(conversationId, input.path);
-    const s = await stat(abs);
-    if (!s.isFile()) throw new Error(`Not a file: ${input.path}`);
+    const s = await stat(abs).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) {
+        throw new NotFoundException(`Workspace file not found: ${input.path}`);
+      }
+      throw error;
+    });
+    if (!s.isFile()) throw new NotFoundException(`Workspace file not found: ${input.path}`);
 
     const maxBytes = clampInt(input.maxBytes ?? 200_000, 1, 1_000_000);
     const bytesToRead = Math.min(s.size, maxBytes);
@@ -154,6 +159,75 @@ export class WorkspaceService {
       size: s.size,
       mtime: s.mtime.toISOString(),
     };
+  }
+
+  async writeBinaryFile(
+    conversationId: string,
+    input: { path: string; buffer: Buffer },
+  ): Promise<WorkspaceWriteResult> {
+    const abs = this.resolveInside(conversationId, input.path);
+    await mkdir(path.dirname(abs), { recursive: true });
+    await writeFile(abs, input.buffer);
+    const s = await stat(abs);
+    return {
+      path: toPosixPath(path.relative(this.getConversationRoot(conversationId), abs)),
+      size: s.size,
+      mtime: s.mtime.toISOString(),
+    };
+  }
+
+  async writeUploadedFile(
+    conversationId: string,
+    input: { name: string; mimeType: string; base64: string },
+  ): Promise<WorkspaceUploadResult> {
+    const buffer = decodeBase64Payload(input.base64);
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new BadRequestException('File is too large; max upload size is 10 MB');
+    }
+    const safeName = sanitizeFilename(input.name);
+    const day = new Date().toISOString().slice(0, 10);
+    const stamp = Date.now().toString(36);
+    const path = `attachments/${day}/${stamp}-${safeName}`;
+    const written = await this.writeBinaryFile(conversationId, { path, buffer });
+    return {
+      id: `${stamp}-${Math.random().toString(36).slice(2, 8)}`,
+      name: safeName,
+      path: written.path,
+      mimeType: input.mimeType || 'application/octet-stream',
+      size: written.size,
+      kind: attachmentKind(input.mimeType, safeName),
+    };
+  }
+
+  async readBinaryFile(
+    conversationId: string,
+    input: { path: string; maxBytes?: number },
+  ): Promise<WorkspaceBinaryReadResult> {
+    const abs = this.resolveInside(conversationId, input.path);
+    const s = await stat(abs).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) {
+        throw new NotFoundException(`Workspace file not found: ${input.path}`);
+      }
+      throw error;
+    });
+    if (!s.isFile()) throw new NotFoundException(`Workspace file not found: ${input.path}`);
+    const maxBytes = clampInt(input.maxBytes ?? 10 * 1024 * 1024, 1, 10 * 1024 * 1024);
+    if (s.size > maxBytes) {
+      throw new BadRequestException(`File exceeds maxBytes: ${input.path}`);
+    }
+    const handle = await open(abs, 'r');
+    try {
+      const buffer = Buffer.alloc(s.size);
+      const { bytesRead } = await handle.read(buffer, 0, s.size, 0);
+      return {
+        path: toPosixPath(path.relative(this.getConversationRoot(conversationId), abs)),
+        buffer: buffer.subarray(0, bytesRead),
+        size: s.size,
+        sha256: createHash('sha256').update(buffer.subarray(0, bytesRead)).digest('hex'),
+      };
+    } finally {
+      await handle.close();
+    }
   }
 
   async readFiles(
@@ -207,7 +281,12 @@ export class WorkspaceService {
       throw new Error('Refusing to delete the workspace root');
     }
     const abs = this.resolveInside(conversationId, input.path);
-    const s = await stat(abs);
+    const s = await stat(abs).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) {
+        throw new NotFoundException(`Workspace path not found: ${input.path}`);
+      }
+      throw error;
+    });
     if (s.isDirectory()) {
       if (!input.recursive) throw new Error('Directory delete requires recursive=true');
       await rm(abs, { recursive: true, force: true });
@@ -217,20 +296,29 @@ export class WorkspaceService {
     return { path: input.path, deleted: true };
   }
 
-  async runCommand(conversationId: string, input: { command: string; timeoutMs?: number }): Promise<TerminalRunResult> {
+  async runCommand(
+    conversationId: string,
+    input: { command: string; cwd?: string; timeoutMs?: number },
+  ): Promise<TerminalRunResult> {
     if (!input.command || !input.command.trim()) throw new Error('command is required');
     if (process.env.AGENTHUB_ENABLE_TERMINAL === 'false') {
       throw new Error('terminal_run is disabled by AGENTHUB_ENABLE_TERMINAL=false');
     }
 
-    const cwd = await this.ensureWorkspace(conversationId);
-    const timeoutMs = clampInt(input.timeoutMs ?? 20_000, 1_000, 120_000);
+    const cwd = await this.resolveTerminalCwd(conversationId, input.cwd);
+    // Ceiling raised to 10 min: real `npm install` / `next build` in the
+    // verification loop legitimately exceeds 2 min on a cold workspace.
+    const timeoutMs = clampInt(input.timeoutMs ?? 20_000, 1_000, 600_000);
     const maxOutput = 32_000;
+    const cwdMarker = `__AGENTHUB_CWD_${Date.now()}_${Math.random().toString(36).slice(2)}__=`;
+    const exitMarker = `__AGENTHUB_EXIT_${Date.now()}_${Math.random().toString(36).slice(2)}__=`;
+    const shell = process.platform === 'win32' ? 'powershell' : 'pwsh';
+    const shellInvocation = createPowerShellInvocation(input.command, cwdMarker, exitMarker);
 
     return await new Promise<TerminalRunResult>((resolve) => {
-      const child = spawn(input.command, {
+      const child = spawn(shell === 'powershell' ? 'powershell.exe' : 'pwsh', shellInvocation, {
         cwd,
-        shell: true,
+        shell: false,
         windowsHide: true,
         env: { ...process.env, AGENTHUB_WORKSPACE: cwd },
       });
@@ -240,6 +328,8 @@ export class WorkspaceService {
       let truncated = false;
       let timedOut = false;
       let settled = false;
+      let finalCwd = cwd;
+      let commandExitCode: number | null = null;
 
       const append = (target: 'stdout' | 'stderr', chunk: Buffer | string) => {
         const currentTotal = stdout.length + stderr.length;
@@ -268,7 +358,9 @@ export class WorkspaceService {
         clearTimeout(timer);
         resolve({
           command: input.command,
-          cwd,
+          cwd: finalCwd,
+          startedCwd: cwd,
+          shell,
           exitCode: null,
           signal: null,
           timedOut,
@@ -281,10 +373,22 @@ export class WorkspaceService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        const parsed = parseTerminalMarkers(stdout, cwdMarker, exitMarker);
+        const root = this.getConversationRoot(conversationId);
+        stdout = parsed.stdout;
+        finalCwd = parsed.cwd ?? finalCwd;
+        commandExitCode = parsed.exitCode ?? code;
+        if (!isInside(root, finalCwd)) {
+          stderr += `${stderr ? '\n' : ''}cwd escaped the project workspace; reset to workspace root`;
+          finalCwd = root;
+          commandExitCode = commandExitCode === 0 ? 1 : commandExitCode;
+        }
         resolve({
           command: input.command,
-          cwd,
-          exitCode: code,
+          cwd: finalCwd,
+          startedCwd: cwd,
+          shell,
+          exitCode: commandExitCode,
           signal,
           timedOut,
           stdout,
@@ -333,6 +437,7 @@ export class WorkspaceService {
       case 'terminal_run':
         return await this.runCommand(conversationId, {
           command: requiredString(args.command, 'command'),
+          cwd: optionalString(args.cwd),
           timeoutMs: optionalNumber(args.timeoutMs),
         });
       default:
@@ -348,6 +453,25 @@ export class WorkspaceService {
     }
     const abs = path.resolve(root, normalized || '.');
     assertInside(root, abs);
+    return abs;
+  }
+
+  private async resolveTerminalCwd(conversationId: string, cwd?: string): Promise<string> {
+    const root = await this.ensureWorkspace(conversationId);
+    if (!cwd || cwd.trim() === '') return root;
+
+    const trimmed = cwd.trim();
+    const abs = path.isAbsolute(trimmed)
+      ? path.resolve(trimmed)
+      : this.resolveInside(conversationId, trimmed);
+    assertInside(root, abs);
+    const s = await stat(abs).catch((error: unknown) => {
+      if (isNodeError(error, 'ENOENT')) {
+        throw new BadRequestException(`Terminal cwd not found: ${cwd}`);
+      }
+      throw error;
+    });
+    if (!s.isDirectory()) throw new BadRequestException(`Terminal cwd is not a directory: ${cwd}`);
     return abs;
   }
 }
@@ -379,6 +503,22 @@ export interface WorkspaceWriteResult {
   mtime: string;
 }
 
+export interface WorkspaceUploadResult {
+  id: string;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  kind: 'image' | 'text' | 'file';
+}
+
+export interface WorkspaceBinaryReadResult {
+  path: string;
+  buffer: Buffer;
+  size: number;
+  sha256: string;
+}
+
 export interface WorkspaceBatchReadResult {
   count: number;
   files: Array<
@@ -403,6 +543,8 @@ export interface WorkspaceDeleteResult {
 export interface TerminalRunResult {
   command: string;
   cwd: string;
+  startedCwd: string;
+  shell: 'powershell' | 'pwsh';
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
@@ -513,11 +655,12 @@ const WORKSPACE_TOOL_SCHEMAS: ToolSchema[] = [
   },
   {
     name: 'terminal_run',
-    description: 'Run a shell command in the current conversation workspace and return stdout, stderr, and exit code.',
+    description: 'Run a PowerShell command in the current conversation workspace and return stdout, stderr, exit code, and final cwd.',
     parameters: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'Shell command to run from the workspace root.' },
+        command: { type: 'string', description: 'PowerShell command to run.' },
+        cwd: { type: 'string', description: 'Current working directory. Defaults to the workspace root. Must stay inside the workspace.' },
         timeoutMs: { type: 'number', description: 'Timeout in milliseconds. Default 20000, max 120000.' },
       },
       required: ['command'],
@@ -531,11 +674,42 @@ function sanitizeConversationId(id: string): string {
   return safe || 'default';
 }
 
+function sanitizeFilename(name: string): string {
+  const basename = path.basename(name || 'attachment');
+  const safe = basename.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return safe || 'attachment';
+}
+
+function decodeBase64Payload(payload: string): Buffer {
+  const raw = payload.includes(',') ? payload.slice(payload.indexOf(',') + 1) : payload;
+  if (!/^[a-zA-Z0-9+/=\r\n]+$/.test(raw)) {
+    throw new BadRequestException('Invalid base64 payload');
+  }
+  return Buffer.from(raw, 'base64');
+}
+
+function attachmentKind(mimeType: string, name: string): 'image' | 'text' | 'file' {
+  const mime = mimeType.toLowerCase();
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('text/') || /\.(md|txt|json|csv|ts|tsx|js|jsx|css|html|xml|yaml|yml)$/i.test(name)) {
+    return 'text';
+  }
+  return 'file';
+}
+
 function assertInside(root: string, target: string): void {
-  const relative = path.relative(root, target);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+  if (!isInside(root, target)) {
     throw new Error(`Path escapes workspace root: ${target}`);
   }
+}
+
+function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function isInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
 function toPosixPath(p: string): string {
@@ -544,6 +718,86 @@ function toPosixPath(p: string): string {
 
 function shouldIgnore(name: string): boolean {
   return name === '.git' || name === 'node_modules' || name === '.next' || name === 'dist' || name === '.turbo';
+}
+
+function createPowerShellInvocation(command: string, cwdMarker: string, exitMarker: string): string[] {
+  const script = [
+    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$__agenthubExitCode = 0",
+    'try {',
+    '  $__agenthubOutput = & {',
+    command,
+    '  } 2>&1',
+    '  $__agenthubSucceeded = $?',
+    '  if ($null -ne $__agenthubOutput) {',
+    '    $__agenthubOutput | Out-String -Width 2000 | Write-Output',
+    '  }',
+    '  if ($null -ne $global:LASTEXITCODE -and $global:LASTEXITCODE -ne 0) {',
+    '    $__agenthubExitCode = [int]$global:LASTEXITCODE',
+    '  } elseif (-not $__agenthubSucceeded) {',
+    '    $__agenthubExitCode = 1',
+    '  }',
+    '} catch {',
+    '  Write-Error $_',
+    '  $__agenthubExitCode = 1',
+    '}',
+    `Write-Output "${exitMarker}$__agenthubExitCode"`,
+    `Write-Output "${cwdMarker}$((Get-Location).ProviderPath)"`,
+    'exit $__agenthubExitCode',
+  ].join('\n');
+
+  return ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script];
+}
+
+function parseTerminalMarkers(
+  stdout: string,
+  cwdMarker: string,
+  exitMarker: string,
+): { stdout: string; cwd?: string; exitCode?: number } {
+  let cwd: string | undefined;
+  let exitCode: number | undefined;
+  const lines = stdout.split(/\r?\n/);
+  const visible: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith(cwdMarker)) {
+      cwd = line.slice(cwdMarker.length).trim();
+      continue;
+    }
+    if (line.startsWith(exitMarker)) {
+      const parsed = Number(line.slice(exitMarker.length).trim());
+      if (Number.isFinite(parsed)) exitCode = parsed;
+      continue;
+    }
+    visible.push(line);
+  }
+
+  return { stdout: normalizeTerminalOutput(visible.join('\n')), cwd, exitCode };
+}
+
+function normalizeTerminalOutput(output: string): string {
+  const lines = output
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/g, ''));
+
+  while (lines.length > 0 && lines[0]?.trim() === '') lines.shift();
+  while (lines.length > 0 && lines[lines.length - 1]?.trim() === '') lines.pop();
+
+  const normalized: string[] = [];
+  let blankCount = 0;
+  for (const line of lines) {
+    if (line.trim() === '') {
+      blankCount += 1;
+      if (blankCount <= 1) normalized.push('');
+      continue;
+    }
+    blankCount = 0;
+    normalized.push(line);
+  }
+
+  return normalized.join('\n');
 }
 
 function clampInt(value: number, min: number, max: number): number {

@@ -1,6 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
-import type { AgentAdapter, AdapterRegistry, ChatRequest } from '@agenthub/adapter-core';
-import type { ClientEvent, ServerEvent } from '@agenthub/shared-types';
+import type { AgentAdapter, AdapterRegistry, ChatRequest, ContentPart } from '@agenthub/adapter-core';
+import { type ClientEvent, type MessageAttachment, type MessageContent, type ServerEvent, PROJECT_PLANNER_MENTION } from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import type { OrchestratorService } from '../orchestrator/orchestrator.service.js';
@@ -9,6 +9,7 @@ import { AgentsRepo } from '../db/agents.repo.js';
 import { ConversationsRepo } from '../db/conversations.repo.js';
 import { TracingService } from '../observability/tracing.service.js';
 import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
+import { WorkspaceService } from '../workspace/workspace.service.js';
 
 interface ResolvedAgent {
   agentId: string;          // the canonical agent id (UUID or built-in slug)
@@ -56,6 +57,7 @@ export class MentionRouter {
     private readonly convsRepo: ConversationsRepo,
     private readonly adapterFactory: AdapterFactoryService,
     private readonly toolRunner: AgentToolRunnerService,
+    private readonly workspace: WorkspaceService,
   ) {}
 
   async route(
@@ -65,12 +67,15 @@ export class MentionRouter {
   ): Promise<void> {
     if (event.mentions.length === 0) return;
 
-    // If user explicitly invokes Orchestrator (mention "@orchestrator"),
-    // delegate the goal to it instead of a single agent. Orchestrator opens
-    // its own trace internally.
-    if (event.mentions.includes('orchestrator')) {
-      const text = event.content.kind === 'text' ? event.content.text : '';
-      await orchestrator.plan({ conversationId: event.conversationId, rootGoal: text }, send);
+    // Project planning is an internal route. The visible planner speaker is
+    // resolved by OrchestratorService from the conversation's architect member.
+    if (event.mentions.includes(PROJECT_PLANNER_MENTION) || event.mentions.includes('orchestrator')) {
+      // rootGoal must stay human-readable: it shows in the Plan panel and is
+      // echoed back in chat. The verbose attachment block (hashes, full
+      // workspace paths, text excerpts) is for the *executing* agents, not
+      // the displayed goal — keep just the user's words + a short note.
+      const goal = contentToPlannerGoal(event.content);
+      await orchestrator.plan({ conversationId: event.conversationId, rootGoal: goal }, send);
       return;
     }
 
@@ -103,6 +108,7 @@ export class MentionRouter {
     const realConvId = this.messages.resolveConversationUuid(event.conversationId);
     const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
     const groupRules = conv?.groupSystemPrompt ?? null;
+    const userContent = await this.contentToAdapterContent(event.conversationId, event.content);
 
     await Promise.all(
       peers.map((self) =>
@@ -111,7 +117,7 @@ export class MentionRouter {
           peers,
           groupRules,
           conversationId: event.conversationId,
-          userText: event.content.kind === 'text' ? event.content.text : '',
+          userContent,
           hop: 0,
           send,
         }),
@@ -132,7 +138,7 @@ export class MentionRouter {
         systemPrompt: a.systemPrompt ?? '',
       };
     }
-    // Legacy: caller passed an adapter id directly (e.g. 'deepseek-v3') and
+    // Legacy: caller passed an adapter id directly (e.g. 'deepseek-v4-flash') and
     // somehow it isn't in the DB. Use a synthesized profile.
     const adapterId = this.registry.has(mention) ? mention : this.fallbackAdapter();
     return {
@@ -144,7 +150,7 @@ export class MentionRouter {
   }
 
   private fallbackAdapter(): string {
-    const preference = ['deepseek-v3', 'claude-code', 'codex', 'doubao', 'mock'];
+    const preference = ['deepseek-v4-flash', 'claude-code', 'codex', 'doubao', 'mock'];
     for (const id of preference) if (this.registry.has(id)) return id;
     return 'mock';
   }
@@ -192,7 +198,7 @@ export class MentionRouter {
     peers: ResolvedAgent[];
     groupRules: string | null;
     conversationId: string;
-    userText: string;
+    userContent: string | ContentPart[];
     hop: number;
     send: (e: ServerEvent) => void;
   }): Promise<void> {
@@ -221,7 +227,7 @@ export class MentionRouter {
     const req: ChatRequest = {
       taskId: msgId,
       systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules),
-      messages: [{ role: 'user', content: args.userText }],
+      messages: [{ role: 'user', content: args.userContent }],
       workspace: {
         id: args.conversationId,
         snapshotId: 'head',
@@ -266,8 +272,99 @@ export class MentionRouter {
         .catch((e) => console.warn('[mention-router] persist agent msg failed', e));
     }
   }
+
+  private async contentToAdapterContent(conversationId: string, content: MessageContent): Promise<string | ContentPart[]> {
+    if (content.kind !== 'text') return '';
+    const attachments = content.attachments ?? [];
+    if (attachments.length === 0) return content.text;
+
+    const text = await this.contentToPromptText(conversationId, content);
+    const parts: ContentPart[] = [{ type: 'text', text }];
+
+    for (const attachment of attachments) {
+      if (attachment.kind !== 'image') continue;
+      try {
+        const file = await this.workspace.readBinaryFile(conversationId, {
+          path: attachment.path,
+          maxBytes: 5 * 1024 * 1024,
+        });
+        parts.push({
+          type: 'image',
+          mimeType: attachment.mimeType,
+          base64: file.buffer.toString('base64'),
+        });
+      } catch {
+        // Keep the text reference; don't fail the whole chat if a thumbnail is too large/missing.
+      }
+    }
+
+    return parts.length > 1 ? parts : text;
+  }
+
+  private async contentToPromptText(conversationId: string, content: MessageContent): Promise<string> {
+    if (content.kind !== 'text') return '';
+    const attachments = content.attachments ?? [];
+    if (attachments.length === 0) return content.text;
+
+    const blocks = [content.text.trim() || '(用户只上传了附件，没有输入文字)'];
+    blocks.push(
+      [
+        '',
+        '## 用户上传的附件',
+        ...attachments.map(
+          (file, index) =>
+            `${index + 1}. ${file.name} (${file.kind}, ${file.mimeType || 'unknown'}, ${formatBytes(file.size)}) - workspace path: ${file.path}`,
+        ),
+      ].join('\n'),
+    );
+
+    const excerpts = await this.readTextAttachmentExcerpts(conversationId, attachments);
+    if (excerpts.length > 0) {
+      blocks.push(['## 附件文本摘录', ...excerpts].join('\n\n'));
+    }
+
+    return blocks.join('\n\n');
+  }
+
+  private async readTextAttachmentExcerpts(conversationId: string, attachments: MessageAttachment[]): Promise<string[]> {
+    const excerpts: string[] = [];
+    for (const file of attachments) {
+      if (file.kind !== 'text') continue;
+      try {
+        const read = await this.workspace.readFile(conversationId, {
+          path: file.path,
+          maxBytes: 16_000,
+        });
+        excerpts.push(`### ${file.name}\n\`\`\`\n${read.content}${read.truncated ? '\n...[truncated]' : ''}\n\`\`\``);
+      } catch {
+        excerpts.push(`### ${file.name}\n无法读取文本内容，请使用 workspace_read 读取 ${file.path}`);
+      }
+    }
+    return excerpts;
+  }
+}
+
+/**
+ * Clean, human-readable goal for the Plan panel + chat echo. Attachments are
+ * summarized in one short line (count only) — the executing agents still get
+ * the full path/excerpt context via `contentToAdapterContent`.
+ */
+function contentToPlannerGoal(content: MessageContent): string {
+  if (content.kind !== 'text') return '';
+  const text = content.text.trim();
+  const n = content.attachments?.length ?? 0;
+  if (n === 0) return text || '(空目标)';
+  const note = `（含 ${n} 个上传附件，已存入工作区 attachments/ 目录）`;
+  return text ? `${text}\n${note}` : `用户上传了 ${n} 个附件，请据此推进。${note}`;
 }
 
 function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes)) return 'unknown size';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
+  return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
 }

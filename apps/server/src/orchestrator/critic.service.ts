@@ -61,9 +61,16 @@ export class CriticService {
       budget: { maxTokens: 300 },
     };
 
+    // Hard timeout: the critic is a separate LLM call NOT covered by the
+    // tool-runner watchdog. Without this, a hung critic leaves the task
+    // stuck in `awaiting-critic` forever. Fail-open (PASS) on timeout so the
+    // pipeline keeps moving rather than dead-locking.
+    const ctrl = new AbortController();
+    const timeoutMs = criticTimeoutMs();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     let raw = '';
     try {
-      for await (const ev of adapter.chat(req)) {
+      for await (const ev of adapter.chat(req, ctrl.signal)) {
         if (ev.type === 'token') raw += ev.text;
         if (ev.type === 'error') {
           this.log.warn(`critic adapter error: ${ev.error.message}`);
@@ -71,8 +78,13 @@ export class CriticService {
         }
       }
     } catch (e) {
-      this.log.warn(`critic adapter threw: ${(e as Error).message}`);
-      return { verdict: 'PASS', reasons: ['critic 调用异常，默认通过'] };
+      const why = ctrl.signal.aborted
+        ? `critic ${Math.round(timeoutMs / 1000)}s 超时，默认通过`
+        : 'critic 调用异常，默认通过';
+      this.log.warn(`critic adapter ${ctrl.signal.aborted ? 'timed out' : 'threw'}: ${(e as Error).message}`);
+      return { verdict: 'PASS', reasons: [why] };
+    } finally {
+      clearTimeout(timer);
     }
 
     const parsed = extractJsonObject(raw);
@@ -96,11 +108,17 @@ export class CriticService {
 
   private pickAdapter() {
     // Always prefer a fast cheap model for the critic — it's a tight loop.
-    for (const id of ['deepseek-v3', 'codex', 'doubao', 'mock']) {
+    for (const id of ['deepseek-v4-flash', 'deepseek-v3', 'codex', 'doubao', 'mock']) {
       if (this.registry.has(id)) return this.registry.get(id);
     }
     return undefined;
   }
+}
+
+function criticTimeoutMs(): number {
+  const raw = Number(process.env.AGENTHUB_CRITIC_TIMEOUT_MS ?? 45_000);
+  if (!Number.isFinite(raw)) return 45_000;
+  return Math.max(10_000, Math.min(180_000, Math.trunc(raw)));
 }
 
 function truncate(s: string, max: number): string {

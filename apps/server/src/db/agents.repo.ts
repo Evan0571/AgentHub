@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { desc, eq, or } from 'drizzle-orm';
+import { desc, eq, inArray, like, or } from 'drizzle-orm';
 import { agents, type Db } from '@agenthub/db';
 import { DB_TOKEN, DEMO_USER_ID } from './constants.js';
 import { decryptSecret, encryptSecret } from '../crypto/crypto.util.js';
@@ -120,11 +120,21 @@ export class AgentsRepo {
     await this.db.delete(agents).where(eq(agents.id, id));
   }
 
+  async deleteByIds(ids: string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.db.delete(agents).where(inArray(agents.id, ids));
+  }
+
+  async deleteScopedForConversation(conversationId: string): Promise<void> {
+    await this.db.delete(agents).where(like(agents.id, `conv-agent-${conversationId}-%`));
+  }
+
   /** Idempotent built-in agent seeding. */
   async ensureBuiltIn(input: {
     id: string;
     name: string;
     adapterId: string;
+    model?: string | null;
     avatarColor: string;
     systemPrompt?: string;
   }): Promise<void> {
@@ -133,11 +143,26 @@ export class AgentsRepo {
       .from(agents)
       .where(eq(agents.id, input.id))
       .limit(1);
-    if (rows.length > 0) return;
+    if (rows.length > 0) {
+      await this.db
+        .update(agents)
+        .set({
+          name: input.name,
+          adapterId: input.adapterId,
+          model: input.model ?? null,
+          systemPrompt: input.systemPrompt ?? '',
+          avatarColor: input.avatarColor,
+          isPublic: true,
+          ownerUserId: null,
+        })
+        .where(eq(agents.id, input.id));
+      return;
+    }
     await this.db.insert(agents).values({
       id: input.id,
       name: input.name,
       adapterId: input.adapterId,
+      model: input.model ?? null,
       systemPrompt: input.systemPrompt ?? '',
       avatarColor: input.avatarColor,
       isPublic: true,
