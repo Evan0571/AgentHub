@@ -192,6 +192,8 @@ interface State {
   sendUserMessage: (conversationId: string, text: string, attachments?: MessageAttachment[]) => void;
   /** Apply plan edits with optimistic concurrency (baseVersion). Server is authoritative. */
   editPlan: (planId: string, edits: PlanEdit[]) => void;
+  /** Re-run one failed/cancelled plan task from the Plan panel. */
+  retryTask: (planId: string, taskId: string) => void;
   /** Request AI-suggested deps for a new task; returns a promise. */
   suggestDeps: (planId: string, newGoal: string) => Promise<{ inputs: string[]; reasoning?: string }>;
   /** Trigger a deployment of the given HTML. Status streams in via deploy_status events. */
@@ -269,6 +271,34 @@ function apiUrl(path: string): string {
     ? `[${window.location.hostname}]`
     : window.location.hostname;
   return `${window.location.protocol}//${hostname}:4000${path}`;
+}
+
+async function apiFetch(path: string, init?: RequestInit, retries = 2): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(apiUrl(path), init);
+      if (res.status >= 500 && attempt < retries) {
+        await sleep(250 * (attempt + 1));
+        continue;
+      }
+      return res;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries || !isTransientFetchError(error)) break;
+      await sleep(250 * (attempt + 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /fetch failed|Failed to fetch|NetworkError|Load failed|ECONNREFUSED|ERR_CONNECTION/i.test(message);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Track which conversations have completed initial hydration to avoid refetches. */
@@ -431,6 +461,17 @@ export const useConversationStore = create<State>((set, get) => ({
     });
   },
 
+  retryTask: (planId, taskId) => {
+    const ws = get().ws;
+    if (ws) ws.connect(true);
+    else get().ensureConnected();
+    get().ws!.send({
+      op: 'retry_task',
+      planId,
+      taskId,
+    });
+  },
+
   suggestDeps: (planId, newGoal) => {
     get().ensureConnected();
     const requestId = 'sugg-' + Math.random().toString(36).slice(2);
@@ -462,7 +503,7 @@ export const useConversationStore = create<State>((set, get) => ({
     if (hydratedConvs.has(id) || hydratingConvs.has(id)) return;
     hydratingConvs.add(id);
     try {
-      const res = await fetch(apiUrl(`/api/conversations/${id}/state`));
+      const res = await apiFetch(`/api/conversations/${id}/state`);
       if (!res.ok) throw new Error(`hydrate ${res.status}`);
       const data = (await res.json()) as {
         conversationId: string;
@@ -509,7 +550,11 @@ export const useConversationStore = create<State>((set, get) => ({
   dismissBanner: () => set({ banner: null }),
 
   ensureConnected: () => {
-    if (get().ws) return;
+    const existing = get().ws;
+    if (existing) {
+      existing.connect();
+      return;
+    }
     const hostname =
       typeof window !== 'undefined' && window.location.hostname.includes(':')
         ? `[${window.location.hostname}]`
@@ -561,7 +606,7 @@ export const useConversationStore = create<State>((set, get) => ({
 
   refreshAgents: async () => {
     try {
-      const r = await fetch(apiUrl('/api/agents'));
+      const r = await apiFetch('/api/agents');
       if (!r.ok) throw new Error(`agents ${r.status}`);
       const data = (await r.json()) as AgentProfile[];
       set(() => ({ agents: data }));
@@ -572,7 +617,7 @@ export const useConversationStore = create<State>((set, get) => ({
 
   refreshConversations: async () => {
     try {
-      const r = await fetch(apiUrl('/api/conversations'));
+      const r = await apiFetch('/api/conversations');
       if (!r.ok) throw new Error(`conversations ${r.status}`);
       const data = (await r.json()) as Array<Parameters<typeof fromServerConv>[0]>;
       const convs = data.map(fromServerConv);
@@ -590,7 +635,7 @@ export const useConversationStore = create<State>((set, get) => ({
 
   fetchUsage: async (conversationId) => {
     try {
-      const r = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(conversationId)}/usage`));
+      const r = await apiFetch(`/api/conversations/${encodeURIComponent(conversationId)}/usage`);
       if (!r.ok) throw new Error(`usage ${r.status}`);
       const data = (await r.json()) as ConversationUsage;
       set((s) => ({ usageByConv: { ...s.usageByConv, [conversationId]: data } }));
@@ -600,7 +645,7 @@ export const useConversationStore = create<State>((set, get) => ({
   },
 
   createConversation: async (input) => {
-    const r = await fetch(apiUrl('/api/conversations'), {
+    const r = await apiFetch('/api/conversations', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(input),
@@ -612,6 +657,9 @@ export const useConversationStore = create<State>((set, get) => ({
       conversations: [conv, ...s.conversations],
       activeId: conv.id,
     }));
+    const ws = get().ws;
+    if (ws) ws.connect(true);
+    else get().ensureConnected();
     hydratedConvs.delete(conv.id);
     void get().hydrate(conv.id);
     return conv;

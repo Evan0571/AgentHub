@@ -49,7 +49,7 @@ export class OrchestratorService {
   ): Promise<Plan> {
     const planningMsgId = cryptoRandomId();
     const plannerAgent = await this.planner.getPlannerProfile(input.conversationId);
-    const intro = `🧭 ${plannerAgent ? `${plannerAgent.name} 正在做架构规划` : '正在拆解目标'}：\n\n> ${input.rootGoal}\n\n_调用${plannerAgent ? '项目架构师' : ' Planner 模型'}中…_`;
+    const intro = `${plannerAgent ? plannerAgent.name : 'Planner'} 正在生成任务 DAG。\n\n目标：${input.rootGoal}`;
     send({
       op: 'msg_started',
       message: {
@@ -75,7 +75,7 @@ export class OrchestratorService {
     } catch (e) {
       const errMsg = (e as Error).message;
       console.error('[orchestrator] planner failed:', errMsg);
-      const failText = `\n\n❌ Plan 拆解失败：${errMsg}\n\n请重试，或检查 server 控制台日志。`;
+      const failText = `\n\nPlan 拆解失败：${errMsg}\n\n请重试，或检查 server 控制台日志。`;
       send({ op: 'msg_token', msgId: planningMsgId, delta: failText });
       send({ op: 'msg_done', msgId: planningMsgId });
       void this.messages
@@ -95,7 +95,7 @@ export class OrchestratorService {
       content: renderTasksMarkdown(plan, plannerAgent),
     });
 
-    const summary = `\n\n✅ 已生成 **${plan.tasks.length}** 个子任务（见右侧 Plan 面板）。开始并发执行 →`;
+    const summary = `\n\nPlan 已生成：${plan.tasks.length} 个任务。开始执行。`;
     send({ op: 'msg_token', msgId: planningMsgId, delta: summary });
     send({ op: 'msg_done', msgId: planningMsgId });
 
@@ -123,6 +123,26 @@ export class OrchestratorService {
 
   async resume(planId: string): Promise<void> {
     await this.plans.setStatus(planId, 'executing');
+  }
+
+  async retryTask(
+    event: Extract<ClientEvent, { op: 'retry_task' }>,
+    send: (e: ServerEvent) => void,
+  ): Promise<void> {
+    const result = await this.plans.retryTask(event.planId, event.taskId);
+    if (result.kind !== 'ok') {
+      send({
+        op: 'error',
+        code: result.kind === 'not_found' ? 'PLAN_TASK_NOT_FOUND' : 'TASK_NOT_RETRYABLE',
+        message: result.message,
+        retryable: result.kind === 'not_retryable',
+      });
+      if ('plan' in result) send({ op: 'plan_update', plan: result.plan });
+      return;
+    }
+
+    send({ op: 'plan_update', plan: result.plan });
+    void this.executor.run(result.plan, send);
   }
 
   async applyPlanEdits(

@@ -18,10 +18,11 @@ export const frontend: PromptRole = {
 1. 接到任务先读 {{workspace.tree}}，避免重复造轮子。
 2. 写代码时直接输出 unified diff（file_patch 工具），不要贴整文件。
 3. 一次提交聚焦一个目标；避免 drive-by refactor。
-4. 完成后用一句话总结改动，并 @reviewer 进行 review。
+4. 完成后只报告关键文件、验证结果和阻塞；不要写流水账或客套结尾。
 
 ## 风格
 - 组件命名 PascalCase；hook 命名 use*。
 - 不写无意义注释；不写多段 JSDoc。
-- 默认暗色模式可用。`,
+- 默认暗色模式可用。
+- 不使用 emoji，不写“我将/首先/接下来/总结/如需请告知”模板句。`,
 };

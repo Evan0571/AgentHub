@@ -3,11 +3,12 @@ import type { Plan, PlanEdit } from './plan.js';
 
 /** Client → Server */
 export type ClientEvent =
-  | { op: 'user_msg'; conversationId: ID; content: MessageContent; mentions: ID[]; replyToId?: ID }
+  | { op: 'user_msg'; conversationId: ID; content: MessageContent; mentions: ID[]; replyToId?: ID; clientEventId?: string }
   | { op: 'cancel'; taskId: ID }
   | { op: 'accept_patch'; snapshotId: ID; hunkIds: string[] }
   | { op: 'reject_patch'; snapshotId: ID; hunkIds: string[] }
   | { op: 'edit_plan'; planId: ID; edits: PlanEdit[]; baseVersion: number }
+  | { op: 'retry_task'; planId: ID; taskId: ID }
   | { op: 'pause_plan'; planId: ID }
   | { op: 'resume_plan'; planId: ID }
   | { op: 'suggest_deps'; planId: ID; requestId: string; newGoal: string }
@@ -16,6 +17,7 @@ export type ClientEvent =
 
 /** Server → Client */
 export type ServerEvent =
+  | { op: 'client_event_ack'; clientEventId: string }
   | { op: 'msg_started'; message: Pick<Message, 'id' | 'conversationId' | 'senderType' | 'senderId' | 'createdAt' | 'replyToId'> }
   | { op: 'msg_token'; msgId: ID; delta: string }
   | { op: 'msg_thinking'; msgId: ID; delta: string }

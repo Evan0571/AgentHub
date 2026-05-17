@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { open, mkdir, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { TextDecoder } from 'node:util';
 import type { ToolSchema } from '@agenthub/adapter-core';
 
 @Injectable()
@@ -320,7 +321,13 @@ export class WorkspaceService {
         cwd,
         shell: false,
         windowsHide: true,
-        env: { ...process.env, AGENTHUB_WORKSPACE: cwd },
+        env: {
+          ...process.env,
+          AGENTHUB_WORKSPACE: cwd,
+          PYTHONIOENCODING: 'utf-8',
+          LANG: process.env.LANG ?? 'C.UTF-8',
+          LC_ALL: process.env.LC_ALL ?? 'C.UTF-8',
+        },
       });
 
       let stdout = '';
@@ -337,7 +344,7 @@ export class WorkspaceService {
           truncated = true;
           return;
         }
-        const text = chunk.toString();
+        const text = decodeTerminalChunk(chunk);
         const remaining = maxOutput - currentTotal;
         const next = text.length > remaining ? text.slice(0, remaining) : text;
         if (text.length > remaining) truncated = true;
@@ -749,10 +756,32 @@ function shouldIgnore(name: string): boolean {
   return name === '.git' || name === 'node_modules' || name === '.next' || name === 'dist' || name === '.turbo';
 }
 
+function decodeTerminalChunk(chunk: Buffer | string): string {
+  if (typeof chunk === 'string') return chunk;
+
+  const utf8 = chunk.toString('utf8');
+  if (!looksGarbled(utf8)) return utf8;
+
+  try {
+    return new TextDecoder('gb18030').decode(chunk);
+  } catch {
+    return utf8;
+  }
+}
+
+function looksGarbled(text: string): boolean {
+  return text.includes('\uFFFD') || text.includes('\u951f\u65a4\u62f7') || /[\u00C3\u00C2][\x80-\xBF]?/.test(text);
+}
+
 function createPowerShellInvocation(command: string, cwdMarker: string, exitMarker: string): string[] {
   const script = [
+    'try { chcp.com 65001 > $null } catch {}',
+    "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)",
     "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
     "$OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+    "$env:PYTHONIOENCODING = 'utf-8'",
+    "$env:LANG = 'C.UTF-8'",
+    "$env:LC_ALL = 'C.UTF-8'",
     "$__agenthubExitCode = 0",
     'try {',
     '  $__agenthubOutput = & {',

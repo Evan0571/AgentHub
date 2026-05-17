@@ -30,7 +30,7 @@ import {
   X,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, useConversationStore, type AgentTerminalEntry } from '@/lib/store';
 import { useTheme } from '@/lib/theme';
 import { Sidebar } from './Sidebar';
 import { ChatPane } from './ChatPane';
@@ -107,6 +107,8 @@ interface TerminalSession {
   historyIndex: number | null;
   entries: TerminalEntry[];
 }
+
+const AGENT_TERMINAL_ID = '__agent_runs__';
 
 interface WorkspaceTreeNode {
   name: string;
@@ -574,7 +576,7 @@ function CodeWorkbench({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(true);
-  const [terminalSeq, setTerminalSeq] = useState(1);
+  const terminalSeqRef = useRef(1);
   const [terminalSessions, setTerminalSessions] = useState<TerminalSession[]>(() => [
     createTerminalSession(1),
   ]);
@@ -634,7 +636,7 @@ function CodeWorkbench({
 
   useEffect(() => {
     const first = createTerminalSession(1);
-    setTerminalSeq(1);
+    terminalSeqRef.current = 1;
     setTerminalSessions([first]);
     setActiveTerminalId(first.id);
   }, [activeId]);
@@ -670,9 +672,9 @@ function CodeWorkbench({
   };
 
   const addTerminal = () => {
-    const nextSeq = terminalSeq + 1;
+    const nextSeq = terminalSeqRef.current + 1;
+    terminalSeqRef.current = nextSeq;
     const session = createTerminalSession(nextSeq);
-    setTerminalSeq(nextSeq);
     setTerminalSessions((sessions) => [...sessions, session]);
     setActiveTerminalId(session.id);
     setTerminalOpen(true);
@@ -683,7 +685,7 @@ function CodeWorkbench({
       const next = sessions.filter((session) => session.id !== id);
       if (next.length === 0) {
         const fresh = createTerminalSession(1);
-        setTerminalSeq(1);
+        terminalSeqRef.current = 1;
         setActiveTerminalId(fresh.id);
         setTerminalOpen(false);
         return [fresh];
@@ -1001,10 +1003,11 @@ function TerminalPane({
   onRun: (id: string) => void;
   onCollapse: () => void;
 }) {
-  const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
   const agentRuns = useConversationStore((s) =>
     s.activeId ? s.agentTerminalByConv[s.activeId] : undefined,
   );
+  const showingAgentRuns = activeId === AGENT_TERMINAL_ID;
+  const active = showingAgentRuns ? undefined : sessions.find((session) => session.id === activeId) ?? sessions[0];
   const outputRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -1013,30 +1016,43 @@ function TerminalPane({
       top: outputRef.current.scrollHeight,
       behavior: 'smooth',
     });
-  }, [active?.entries.length, active?.running]);
+  }, [active?.entries.length, active?.running, agentRuns?.length, showingAgentRuns]);
 
   useEffect(() => {
-    inputRef.current?.focus();
-  }, [active?.id]);
-
-  if (!active) return null;
+    if (!showingAgentRuns) inputRef.current?.focus();
+  }, [active?.id, showingAgentRuns]);
 
   return (
     <section className="shrink-0 border-t border-white/5 bg-bg-soft" style={{ height }}>
       <header className="flex h-9 items-center gap-1 border-b border-white/5 bg-bg-panel/60 px-2">
         <TerminalSquare className="mx-1 h-3.5 w-3.5 text-accent" />
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+          <button
+            onClick={() => onActivate(AGENT_TERMINAL_ID)}
+            className={clsx(
+              'group flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded px-2 text-[11px]',
+              showingAgentRuns
+                ? 'bg-bg text-text shadow-sm ring-1 ring-white/10'
+                : 'text-text-muted hover:bg-white/5 hover:text-text',
+            )}
+            title="Agent command log"
+          >
+            <span className="truncate">Agent Runs</span>
+            {agentRuns && agentRuns.length > 0 ? (
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+            ) : null}
+          </button>
           {sessions.map((session) => (
             <button
               key={session.id}
               onClick={() => onActivate(session.id)}
               className={clsx(
                 'group flex h-7 max-w-44 shrink-0 items-center gap-1.5 rounded px-2 text-[11px]',
-                session.id === active.id
+                session.id === active?.id
                   ? 'bg-bg text-text shadow-sm ring-1 ring-white/10'
                   : 'text-text-muted hover:bg-white/5 hover:text-text',
               )}
-              title={`${session.title} · ${session.cwd ?? 'workspace root'}`}
+              title={`${session.title} in ${session.cwd ?? 'workspace root'}`}
             >
               <span className="truncate">{session.title}</span>
               {session.running ? <span className="h-1.5 w-1.5 rounded-full bg-accent" /> : null}
@@ -1061,8 +1077,9 @@ function TerminalPane({
           <Plus className="h-3.5 w-3.5" />
         </button>
         <button
-          onClick={() => onClear(active.id)}
-          className="rounded p-1.5 text-text-muted hover:bg-white/5 hover:text-text"
+          onClick={() => active && onClear(active.id)}
+          disabled={!active}
+          className="rounded p-1.5 text-text-muted hover:bg-white/5 hover:text-text disabled:cursor-not-allowed disabled:opacity-40"
           title="Clear terminal"
         >
           <Trash2 className="h-3.5 w-3.5" />
@@ -1077,9 +1094,15 @@ function TerminalPane({
       </header>
       <div
         className="h-[calc(100%-36px)] bg-bg font-mono text-[12px] leading-normal"
-        onClick={() => inputRef.current?.focus()}
+        onClick={() => {
+          if (!showingAgentRuns) inputRef.current?.focus();
+        }}
       >
         <div ref={outputRef} className="h-full overflow-auto px-5 py-4">
+          {showingAgentRuns ? (
+            <AgentRunsPane runs={agentRuns ?? []} />
+          ) : active ? (
+            <>
           {active.entries.length === 0 ? (
             <div className="mb-4 whitespace-pre-wrap text-text-muted">
               Windows PowerShell{'\n'}
@@ -1091,35 +1114,6 @@ function TerminalPane({
           ))}
           {active.running ? (
             <div className="mt-1 text-accent">Running...</div>
-          ) : null}
-
-          {agentRuns && agentRuns.length > 0 ? (
-            <div className="mt-3 border-t border-white/5 pt-3">
-              <div className="mb-1 text-[10px] uppercase tracking-wider text-text-muted/70">
-                🤖 Agent 执行的命令（只读）
-              </div>
-              {agentRuns.map((r) => (
-                <div key={r.id} className="mb-2">
-                  <div className="flex items-baseline gap-2">
-                    <span className="shrink-0 text-amber-400/80">
-                      {r.agentName} ❯
-                    </span>
-                    <span className="min-w-0 break-all text-text">{r.command}</span>
-                  </div>
-                  {r.stdout ? (
-                    <pre className="whitespace-pre-wrap text-text-muted">{r.stdout}</pre>
-                  ) : null}
-                  {r.stderr ? (
-                    <pre className="whitespace-pre-wrap text-rose-300/90">{r.stderr}</pre>
-                  ) : null}
-                  <div className="text-[10px] text-text-muted/60">
-                    {r.timedOut
-                      ? '⏱️ timed out'
-                      : `exit ${r.exitCode ?? '?'}`}
-                  </div>
-                </div>
-              ))}
-            </div>
           ) : null}
 
           <div className="mt-1 flex items-baseline gap-2">
@@ -1147,9 +1141,42 @@ function TerminalPane({
               className="min-w-0 flex-1 bg-transparent p-0 text-text caret-accent outline-none disabled:opacity-50"
             />
           </div>
+            </>
+          ) : null}
         </div>
       </div>
     </section>
+  );
+}
+
+function AgentRunsPane({ runs }: { runs: AgentTerminalEntry[] }) {
+  if (runs.length === 0) {
+    return <div className="whitespace-pre-wrap text-text-muted">No agent commands recorded yet.</div>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="text-[10px] uppercase tracking-wider text-text-muted/70">
+        Read-only command log from agent tool runs
+      </div>
+      {runs.map((run) => (
+        <div key={run.id} className="border-b border-white/5 pb-3 last:border-b-0">
+          <div className="flex items-baseline gap-2">
+            <span className="shrink-0 text-amber-400/80">{run.agentName} -</span>
+            <span className="min-w-0 break-all text-text">{run.command}</span>
+          </div>
+          {run.stdout ? (
+            <pre className="mt-1 whitespace-pre-wrap text-text-muted">{run.stdout}</pre>
+          ) : null}
+          {run.stderr ? (
+            <pre className="mt-1 whitespace-pre-wrap text-rose-300/90">{run.stderr}</pre>
+          ) : null}
+          <div className="mt-1 text-[10px] text-text-muted/60">
+            {run.timedOut ? 'timed out' : `exit ${run.exitCode ?? '?'}`}
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 

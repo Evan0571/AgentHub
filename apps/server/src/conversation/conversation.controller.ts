@@ -264,7 +264,7 @@ function composeRoleSystemPrompt(input: {
 }): string {
   const blocks = [
     input.basePrompt.trim(),
-    `## 运行配置\n- 身份：${input.roleName}\n- 模型：${input.modelLabel}\n- 工作方式：按身份职责输出，不要冒充其他成员；需要文件或命令时优先使用 workspace/terminal 工具。`,
+    `## 运行配置\n- 身份：${input.roleName}\n- 模型：${input.modelLabel}\n- 工作方式：按身份职责输出，不要冒充其他成员；需要文件或命令时优先使用 workspace/terminal 工具。\n- 输出风格：不使用 emoji，不写"我将/首先/接下来/总结/如需请告知"模板句，不把工具步骤复述进正文。`,
   ].filter(Boolean);
 
   if (input.skills.length > 0 || input.customSkills?.trim()) {

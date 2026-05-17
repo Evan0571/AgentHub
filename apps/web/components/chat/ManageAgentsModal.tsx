@@ -149,7 +149,7 @@ const ROLE_PRESETS: Array<{ id: string; name: string; description: string; syste
 1. 先读项目结构，避免重复造轮子。
 2. 写代码直接输出可运行片段；不写无意义注释 / 多段 JSDoc。
 3. 一次聚焦一个目标，避免 drive-by refactor。
-4. 完成后用一句话总结，并 @reviewer 进行 review。`,
+4. 完成后只报告关键文件、验证结果和阻塞；不要写流水账、emoji 或客套结尾。`,
   },
   {
     id: 'backend',

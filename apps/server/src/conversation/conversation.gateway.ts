@@ -22,6 +22,8 @@ import { DeployService } from '../deploy/deploy.service.js';
 @Injectable()
 export class ConversationGateway {
   @WebSocketServer() server!: Server;
+  private readonly seenClientEventIds = new Set<string>();
+  private readonly seenClientEventOrder: string[] = [];
 
   private readonly conv: ConversationService;
   private readonly mention: MentionRouter;
@@ -52,6 +54,11 @@ export class ConversationGateway {
 
     switch (event.op) {
       case 'user_msg':
+        if (event.clientEventId) {
+          send({ op: 'client_event_ack', clientEventId: event.clientEventId });
+          if (this.seenClientEventIds.has(event.clientEventId)) return;
+          this.rememberClientEvent(event.clientEventId);
+        }
         await this.conv.handleUserMessage(event, send);
         await this.mention.route(event, send, this.orchestrator);
         return;
@@ -64,6 +71,9 @@ export class ConversationGateway {
         return;
       case 'edit_plan':
         await this.orchestrator.applyPlanEdits(event, send);
+        return;
+      case 'retry_task':
+        await this.orchestrator.retryTask(event, send);
         return;
       case 'pause_plan':
         await this.orchestrator.pause(event.planId);
@@ -80,6 +90,15 @@ export class ConversationGateway {
       case 'replay_request':
         await this.replay.stream(event, send);
         return;
+    }
+  }
+
+  private rememberClientEvent(id: string): void {
+    this.seenClientEventIds.add(id);
+    this.seenClientEventOrder.push(id);
+    while (this.seenClientEventOrder.length > 2000) {
+      const oldest = this.seenClientEventOrder.shift();
+      if (oldest) this.seenClientEventIds.delete(oldest);
     }
   }
 }

@@ -1,10 +1,15 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import type { Plan, PlanEdit, PlanTask } from '@agenthub/shared-types';
 import { PlansRepo } from '../db/plans.repo.js';
 
 type ApplyResult =
   | { kind: 'ok'; plan: Plan }
   | { kind: 'conflict'; serverVersion: number };
+
+type RetryTaskResult =
+  | { kind: 'ok'; plan: Plan }
+  | { kind: 'not_found'; message: string }
+  | { kind: 'not_retryable'; plan: Plan; message: string };
 
 /**
  * Plan persistence + human DAG edits (PRD §5.5.4).
@@ -15,6 +20,7 @@ type ApplyResult =
  */
 @Injectable()
 export class PlanService {
+  private readonly log = new Logger('PlanService');
   private readonly plans = new Map<string, Plan>();
 
   constructor(private readonly repo: PlansRepo) {}
@@ -22,7 +28,9 @@ export class PlanService {
   async save(plan: Plan): Promise<void> {
     this.plans.set(plan.id, plan);
     // Persist asynchronously — don't block hot path on DB.
-    void this.repo.upsert(plan).catch(() => undefined);
+    void this.repo.upsert(plan).catch((e) => {
+      this.log.warn(`persist plan ${plan.id} failed: ${(e as Error).message}`);
+    });
   }
 
   async get(id: string): Promise<Plan | undefined> {
@@ -35,7 +43,14 @@ export class PlanService {
 
   /** Find the latest plan for a conversation (used for hydration). */
   async latestForConversation(conversationSlugOrUuid: string): Promise<Plan | undefined> {
-    return this.repo.latestForConversation(conversationSlugOrUuid);
+    const cached = [...this.plans.values()]
+      .filter((p) => p.conversationId === conversationSlugOrUuid)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+    if (cached) return cached;
+
+    const fromDb = await this.repo.latestForConversation(conversationSlugOrUuid);
+    if (fromDb) this.plans.set(fromDb.id, fromDb);
+    return fromDb;
   }
 
   async setStatus(planId: string, status: Plan['status']): Promise<void> {
@@ -44,7 +59,9 @@ export class PlanService {
     p.status = status;
     p.updatedAt = new Date().toISOString();
     p.version++;
-    void this.repo.upsert(p).catch(() => undefined);
+    void this.repo.upsert(p).catch((e) => {
+      this.log.warn(`persist plan ${p.id} failed: ${(e as Error).message}`);
+    });
   }
 
   async applyEdits(planId: string, edits: PlanEdit[], baseVersion: number): Promise<ApplyResult> {
@@ -83,7 +100,45 @@ export class PlanService {
 
     p.version++;
     p.updatedAt = new Date().toISOString();
-    void this.repo.upsert(p).catch(() => undefined);
+    void this.repo.upsert(p).catch((e) => {
+      this.log.warn(`persist plan ${p.id} failed: ${(e as Error).message}`);
+    });
+    return { kind: 'ok', plan: p };
+  }
+
+  async retryTask(planId: string, taskId: string): Promise<RetryTaskResult> {
+    const p = await this.get(planId);
+    if (!p) return { kind: 'not_found', message: `plan not found: ${planId}` };
+
+    const task = p.tasks.find((t) => t.id === taskId);
+    if (!task) return { kind: 'not_found', message: `task not found: ${taskId}` };
+
+    if (task.status === 'running' || task.status === 'awaiting-critic') {
+      return { kind: 'not_retryable', plan: p, message: `${taskId} is already running` };
+    }
+    if (task.status !== 'failed' && task.status !== 'cancelled') {
+      return { kind: 'not_retryable', plan: p, message: `${taskId} is ${task.status}, not failed` };
+    }
+
+    const previousError = task.error;
+    task.status = 'pending';
+    task.retries = (task.retries ?? 0) + 1;
+    task.startedAt = undefined;
+    task.finishedAt = undefined;
+    task.artifactRefs = undefined;
+    task.outputText = undefined;
+    task.error = undefined;
+    task.criticFeedback = previousError
+      ? `Previous failure: ${previousError.code}: ${previousError.message}`
+      : task.criticFeedback;
+
+    p.status = 'executing';
+    p.version++;
+    p.updatedAt = new Date().toISOString();
+    this.plans.set(p.id, p);
+    await this.repo.upsert(p).catch((e) => {
+      this.log.warn(`persist plan ${p.id} failed: ${(e as Error).message}`);
+    });
     return { kind: 'ok', plan: p };
   }
 }

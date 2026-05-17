@@ -179,7 +179,7 @@ export function ChatPane() {
       lines.push(`## ${m.senderName} · ${m.senderType} · ${ts}`);
       lines.push('');
       if (m.thinking && m.thinking.trim()) {
-        lines.push('<details><summary>思考过程 / 工具活动</summary>');
+        lines.push('<details><summary>工具活动</summary>');
         lines.push('');
         lines.push('```');
         lines.push(m.thinking.trim());

@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type {
   AgentAdapter,
+  AdapterErrorPayload,
   ChatRequest,
   Message,
   ToolCall,
@@ -23,13 +24,15 @@ export interface AgentToolRunInput {
    * rounds and emits a single final `msg_done` itself — so the message
    * stays in the streaming state and the live activity feed keeps showing
    * instead of collapsing to a "done"-looking thinking block mid-task.
-   */
+  */
   suppressDone?: boolean;
+  suppressRetryableErrors?: boolean;
 }
 
 export interface AgentToolRunResult {
   output: string;
   errored: boolean;
+  error?: AdapterErrorPayload;
 }
 
 @Injectable()
@@ -50,6 +53,7 @@ export class AgentToolRunnerService {
       const toolCalls: ToolCall[] = [];
       let roundText = '';
       let roundErrored = false;
+      let roundError: AdapterErrorPayload | undefined;
 
       const request: ChatRequest = {
         ...input.request,
@@ -109,7 +113,7 @@ export class AgentToolRunnerService {
               input.send({
                 op: 'msg_thinking',
                 msgId: input.msgId,
-                delta: `\n✏️ 修改 ${event.path}\n`,
+                delta: `\n修改 ${event.path}\n`,
               });
               break;
             case 'done':
@@ -117,7 +121,8 @@ export class AgentToolRunnerService {
               break;
             case 'error':
               roundErrored = true;
-              input.send({ op: 'msg_error', msgId: input.msgId, error: event.error });
+              roundError = normalizeAdapterError(event.error, input.signal);
+              surfaceAdapterError(input, roundError);
               break;
           }
         }
@@ -133,7 +138,15 @@ export class AgentToolRunnerService {
             },
           });
           if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
-          return { output, errored: true };
+          return {
+            output,
+            errored: true,
+            error: {
+              code: 'INTERNAL',
+              message: `Agent produced no stream events for ${Math.round(idleMs / 1000)}s`,
+              retryable: true,
+            },
+          };
         }
         input.send({
           op: 'msg_error',
@@ -145,12 +158,20 @@ export class AgentToolRunnerService {
           },
         });
         if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
-        return { output, errored: true };
+        return {
+          output,
+          errored: true,
+          error: {
+            code: 'INTERNAL',
+            message: e instanceof Error ? e.message : String(e),
+            retryable: true,
+          },
+        };
       } finally {
         if (idleTimer) clearTimeout(idleTimer);
       }
 
-      if (roundErrored) return { output, errored: true };
+      if (roundErrored) return { output, errored: true, error: roundError };
 
       if (toolCalls.length === 0) {
         if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
@@ -242,6 +263,30 @@ export class AgentToolRunnerService {
   }
 }
 
+function normalizeAdapterError(error: AdapterErrorPayload, callerSignal?: AbortSignal): AdapterErrorPayload {
+  if (error.code === 'CANCELLED' && !callerSignal?.aborted) {
+    return {
+      ...error,
+      message: error.message || 'stream aborted before completion',
+      retryable: true,
+    };
+  }
+  return error;
+}
+
+function surfaceAdapterError(input: AgentToolRunInput, error: AdapterErrorPayload): void {
+  if (input.suppressRetryableErrors && error.retryable) {
+    input.send({
+      op: 'msg_thinking',
+      msgId: input.msgId,
+      delta: `\nAgent stream interrupted: ${error.code} - ${error.message}\n`,
+    });
+    return;
+  }
+
+  input.send({ op: 'msg_error', msgId: input.msgId, error });
+}
+
 function appendWorkspaceInstructions(systemPrompt: string | undefined, toolUse: boolean): string | undefined {
   if (!toolUse) return systemPrompt;
   const instructions =
@@ -253,7 +298,11 @@ function appendWorkspaceInstructions(systemPrompt: string | undefined, toolUse: 
     '- For project generation or multi-file edits, prefer `workspace_write_many` over repeated `workspace_write` calls.\n' +
     '- For inspecting several files, prefer `workspace_read_many` over repeated `workspace_read` calls.\n' +
     '- After writing a coherent batch of files, run one focused verification command instead of repeatedly checking after every small edit.\n' +
-    '- If the remaining work is mostly explanation, stop using tools and provide the final status.';
+    '- If the remaining work is mostly explanation, stop using tools and provide the final status.\n\n' +
+    'Output style rules:\n' +
+    '- Do not use emoji.\n' +
+    '- Do not narrate every tool step in the final answer; the UI already shows tool activity separately.\n' +
+    '- Avoid canned phrases like "I will", "first", "next", "summary", and "let me know". Report concrete results, files changed, verification, and blockers.';
   return [systemPrompt, instructions].filter(Boolean).join('\n\n');
 }
 
@@ -301,27 +350,27 @@ function argStr(args: unknown, key: string): string | undefined {
 function describeToolCall(name: string, args: unknown): string {
   switch (name) {
     case 'workspace_write':
-      return `✏️ 写入 ${argStr(args, 'path') ?? '文件'}`;
+      return `写入 ${argStr(args, 'path') ?? '文件'}`;
     case 'workspace_write_many': {
       const files = (args as { files?: unknown[] })?.files;
       const n = Array.isArray(files) ? files.length : 0;
-      return `✏️ 批量写入 ${n} 个文件`;
+      return `批量写入 ${n} 个文件`;
     }
     case 'workspace_read':
-      return `📖 读取 ${argStr(args, 'path') ?? '文件'}`;
+      return `读取 ${argStr(args, 'path') ?? '文件'}`;
     case 'workspace_read_many': {
       const files = (args as { files?: unknown[] })?.files;
       const n = Array.isArray(files) ? files.length : 0;
-      return `📖 读取 ${n} 个文件`;
+      return `读取 ${n} 个文件`;
     }
     case 'workspace_list':
-      return `📂 浏览 ${argStr(args, 'path') ?? '工作区'}`;
+      return `浏览 ${argStr(args, 'path') ?? '工作区'}`;
     case 'workspace_delete':
-      return `🗑️ 删除 ${argStr(args, 'path') ?? ''}`;
+      return `删除 ${argStr(args, 'path') ?? ''}`;
     case 'terminal_run':
-      return `▶️ 运行 \`${(argStr(args, 'command') ?? '').slice(0, 120)}\``;
+      return `运行 \`${(argStr(args, 'command') ?? '').slice(0, 120)}\``;
     default:
-      return `🔧 ${name} ${safeCompactJson(args)}`;
+      return `${name} ${safeCompactJson(args)}`;
   }
 }
 
@@ -332,14 +381,14 @@ function describeToolDone(name: string, args: unknown, result: unknown): string 
 
   if (name === 'terminal_run') {
     const inner = (r?.result ?? {}) as { exitCode?: number | null; timedOut?: boolean };
-    if (inner.timedOut) return `⏱️ 命令超时`;
+    if (inner.timedOut) return `命令超时`;
     return inner.exitCode === 0
-      ? `✓ 命令完成（exit 0）`
-      : `⚠️ 命令退出码 ${inner.exitCode ?? '?'}`;
+      ? `命令完成（exit 0）`
+      : `命令退出码 ${inner.exitCode ?? '?'}`;
   }
-  if (name === 'workspace_write' || name === 'workspace_write_many') return `✓ 已写入`;
+  if (name === 'workspace_write' || name === 'workspace_write_many') return `已写入`;
   if (name === 'workspace_read' || name === 'workspace_read_many' || name === 'workspace_list')
-    return `✓ 已读取`;
-  if (name === 'workspace_delete') return `✓ 已删除`;
-  return `✓ 完成`;
+    return `已读取`;
+  if (name === 'workspace_delete') return `已删除`;
+  return `完成`;
 }

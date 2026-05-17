@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import type { AdapterRegistry, AgentAdapter, ChatRequest } from '@agenthub/adapter-core';
 import type { Plan, PlanTask, AcceptanceRule } from '@agenthub/shared-types';
 import { planner as plannerPrompt } from '@agenthub/prompts';
@@ -53,13 +54,17 @@ export class PlannerService {
     const plannerAgent = await this.resolvePlannerAgent(input.conversationId);
     const adapter = plannerAgent?.adapter ?? this.pickAdapter();
     if (!adapter) return this.cannedPlan(input, catalog.ids);
+    const conversation = await this.convs.getById(input.conversationId).catch(() => null);
+    const projectTitle = conversation?.title?.trim();
 
     const userMsg =
+      (projectTitle ? `项目名称：${projectTitle}\n` : '') +
       `根目标：${input.rootGoal}\n\n` +
       `可用 Agent（必须从这些 id 里选 candidateAgents，禁止编造其它 id）：\n` +
       catalog.text +
       `\n\n` +
       `要求：\n` +
+      `- 拆解必须围绕项目名称和根目标里的真实领域展开；不要把项目写成"登录 + 数据展示"这种通用模板。\n` +
       `- 任务要**针对这个具体项目**拆解（用到项目里的真实功能/模块名），不要输出"定义产品目标""设计文件结构"这种放之四海皆准的空壳。\n` +
       `- 先 MVP 再扩展：第一批任务交付一个能跑起来的最小闭环，后续任务再加增强功能，不要一个任务想做完所有事。\n` +
       `- **全员覆盖**：上面列出的每一个 agent（组长 team-lead 除外）都必须**至少被分配到 1 个任务**（写进它的 candidateAgents）。不要让任何成员闲置——前端/后端/测试/审查/环境/产品/资深用户/风险审视都要有活干，必要时为某个角色单开一个任务（如测试员→写并跑测试，风险审视员→安全/边界审查，资深用户→可用性走查）。\n` +
@@ -127,6 +132,9 @@ export class PlannerService {
     const memberIds = [...catalog.ids].filter((id) => id !== 'orchestrator' && id !== 'mock');
     if (memberIds.length === 0) return fallback;
 
+    const deterministic = deterministicTriage(input.text, input.recentContext, memberIds);
+    if (deterministic) return deterministic;
+
     const plannerAgent = await this.resolvePlannerAgent(input.conversationId);
     const adapter = plannerAgent?.adapter ?? this.pickAdapter();
     if (!adapter) return fallback;
@@ -134,6 +142,8 @@ export class PlannerService {
     const sys =
       `你是项目组长（团队调度大脑），负责"分流"用户消息。只输出一个 JSON，无任何解释、无 markdown 围栏。\n\n` +
       `判定规则：\n` +
+      `- 如果最近已经在同一个项目/Plan 上推进，用户说"继续、按你的理解写、修正、补充、哪里没做完、这不相关"之类跟进话，不要重新 plan；mode="dispatch"，交给上一个相关角色。\n` +
+      `- 用户问"还有任务没做完吗/现在进度怎样/剩哪些任务"属于状态查询，不要重新 plan；选项目组长或架构师做简短状态回复。\n` +
       `- 用户要"做一个完整项目 / 从零搭建 / 全栈 / 大重构 / 多模块" → mode="plan"。\n` +
       `- 用户是"小改动 / 修个 bug / 加个按钮 / 调样式 / 解释 / 跑个命令 / 端口冲突"等 → mode="dispatch"，并从下面成员里选 1-3 个最合适的 agentId 放进 targets，brief 写清楚要他们做什么。\n` +
       `- 不确定时倾向 dispatch（更轻、更快），除非明显是大项目。\n\n` +
@@ -518,10 +528,83 @@ function pickDefault(registry: AdapterRegistry): string | undefined {
   return undefined;
 }
 
+function deterministicTriage(
+  text: string,
+  recentContext: string,
+  memberIds: string[],
+): { mode: 'dispatch'; targets: string[]; brief: string } | null {
+  const t = text.trim();
+  const latest = t.toLowerCase();
+  const context = recentContext.toLowerCase();
+  const normalized = t.toLowerCase();
+
+  const looksLikeNewProject = /做一个|创建|新建|从零|完整项目|全栈|重新做|另一个项目/.test(t);
+  const isFollowUp =
+    /继续|接着|按你的理解|直接.*写|直接.*做|你来定|不用问|不用确认|不相关|没提及|补充|完善|修正|改成|报错|失败|怎么还|咋/.test(t) ||
+    (normalized.length <= 80 && Boolean(recentContext.trim()) && !looksLikeNewProject);
+  if (!isFollowUp) return null;
+
+  const target =
+    pickMemberByRole(memberIds, latest) ??
+    pickMemberByRole(memberIds, context) ??
+    pickBySuffix(memberIds, 'solution-architect') ??
+    memberIds[0];
+  if (!target) return null;
+  return {
+    mode: 'dispatch',
+    targets: [target],
+    brief: makeDispatchBrief(t, target),
+  };
+}
+
+function pickMemberByRole(memberIds: string[], text: string): string | undefined {
+  const roleHints: Array<[RegExp, string[]]> = [
+    [/prd|需求|产品|用户|场景|验收|黑灰产|情报/i, ['product-analyst']],
+    [/plan|dag|架构|技术方案|tasks|architecture/i, ['solution-architect']],
+    [/前端|页面|界面|ui|ux|样式|交互|preview|react|css/i, ['frontend-engineer']],
+    [/后端|api|接口|数据库|服务端|backend|express|server/i, ['backend-engineer']],
+    [/测试|验证|报错|失败|构建|运行|build|test|typecheck/i, ['qa-tester', 'env-engineer']],
+    [/部署|环境|依赖|端口|docker|vercel|启动/i, ['env-engineer']],
+    [/风险|安全|边界|合规|审查|review/i, ['risk-critic', 'code-reviewer']],
+  ];
+  for (const [re, suffixes] of roleHints) {
+    if (!re.test(text)) continue;
+    for (const suffix of suffixes) {
+      const hit = pickBySuffix(memberIds, suffix);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+function pickBySuffix(memberIds: string[], suffix: string): string | undefined {
+  return memberIds.find((id) => id === suffix || id.endsWith(`-${suffix}`));
+}
+
+function makeDispatchBrief(text: string, target: string): string {
+  const role = target.split('-').slice(-2).join('-');
+  if (/按你的理解|你来定|不用问|不用确认/.test(text)) {
+    return '基于已有项目名称、附件和当前工作区直接补齐产物；只有遇到阻断性信息缺失才提问。';
+  }
+  if (/不相关|没提及|黑灰产|情报/.test(text)) {
+    return '立即按真实项目领域修正文档和后续产物，围绕黑灰产情报分析，不要再输出通用登录/数据展示模板。';
+  }
+  if (/继续|接着/.test(text)) {
+    return '接着上一轮未完成的产物继续写入工作区，避免重新规划。';
+  }
+  if (/报错|失败|修/.test(text)) {
+    return '根据真实错误和当前工作区直接定位修复，修完后运行一次验证。';
+  }
+  if (/product-analyst/.test(role)) {
+    return '检查并完善需求文档，优先写入工作区文件，不做泛泛解释。';
+  }
+  return text;
+}
+
 function isCodingGoal(goal: string): boolean {
   return /实现|前端|后端|联调|美化|页面|组件|API|接口|CRUD|部署|Docker|代码|修复|测试|compile|build|frontend|backend|deploy|style|ui/i.test(goal);
 }
 
 function cryptoRandomId(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  return randomUUID();
 }

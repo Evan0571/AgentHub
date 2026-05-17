@@ -20,24 +20,9 @@ export class PlansRepo {
     if (!convId) return;
     // Normalize the plan we store so DB always has the latest conversationId form.
     const dagToStore = { ...plan, conversationId: plan.conversationId };
-    const existing = await this.db
-      .select({ id: plans.id })
-      .from(plans)
-      .where(eq(plans.id, plan.id))
-      .limit(1);
-    if (existing.length > 0) {
-      await this.db
-        .update(plans)
-        .set({
-          rootGoal: plan.rootGoal,
-          status: plan.status,
-          dag: dagToStore as unknown as object,
-          version: plan.version,
-          updatedAt: new Date(plan.updatedAt),
-        })
-        .where(eq(plans.id, plan.id));
-    } else {
-      await this.db.insert(plans).values({
+    await this.db
+      .insert(plans)
+      .values({
         id: plan.id,
         conversationId: convId,
         rootGoal: plan.rootGoal,
@@ -46,8 +31,18 @@ export class PlansRepo {
         version: plan.version,
         createdAt: new Date(plan.createdAt),
         updatedAt: new Date(plan.updatedAt),
+      })
+      .onConflictDoUpdate({
+        target: plans.id,
+        set: {
+          conversationId: convId,
+          rootGoal: plan.rootGoal,
+          status: plan.status,
+          dag: dagToStore as unknown as object,
+          version: plan.version,
+          updatedAt: new Date(plan.updatedAt),
+        },
       });
-    }
   }
 
   async getById(planId: string): Promise<Plan | undefined> {

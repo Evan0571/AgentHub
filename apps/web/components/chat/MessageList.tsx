@@ -230,7 +230,7 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
           <ChevronRight className="h-3 w-3" />
         )}
         <span className="font-medium">
-          {streaming ? '正在思考' : '思考过程'}
+          {streaming ? '执行中' : '工具活动'}
         </span>
         {!open && lastLine ? (
           <span className="ml-1 truncate text-text-muted/70 italic">— {lastLine}</span>

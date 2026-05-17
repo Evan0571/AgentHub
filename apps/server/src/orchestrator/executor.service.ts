@@ -1,5 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
-import type { AdapterRegistry, AgentAdapter, ChatRequest, Message } from '@agenthub/adapter-core';
+import type {
+  AdapterErrorPayload,
+  AdapterRegistry,
+  AgentAdapter,
+  ChatRequest,
+  Message,
+} from '@agenthub/adapter-core';
 import type { Plan, PlanTask, ServerEvent, TaskStatus } from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
@@ -28,6 +34,11 @@ function maxToolRoundsPerAttempt(): number {
   if (!Number.isFinite(raw)) return 80;
   return Math.max(16, Math.min(200, Math.trunc(raw)));
 }
+function maxAgentStreamAttempts(): number {
+  const raw = Number(process.env.AGENTHUB_MAX_AGENT_STREAM_ATTEMPTS ?? 3);
+  if (!Number.isFinite(raw)) return 3;
+  return Math.max(1, Math.min(6, Math.trunc(raw)));
+}
 
 interface ResolvedExecutorAgent {
   agentId: string;
@@ -40,6 +51,7 @@ interface ResolvedExecutorAgent {
 @Injectable()
 export class ExecutorService {
   private readonly aborts = new Map<string, AbortController>();
+  private readonly runningPlans = new Set<string>();
 
   constructor(
     @Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry,
@@ -60,6 +72,18 @@ export class ExecutorService {
    * normal agent messages in the conversation.
    */
   async run(plan: Plan, send: (e: ServerEvent) => void): Promise<void> {
+    if (this.runningPlans.has(plan.id)) {
+      send({
+        op: 'error',
+        code: 'PLAN_ALREADY_RUNNING',
+        message: `Plan ${plan.id} is already executing`,
+        retryable: true,
+      });
+      return;
+    }
+
+    this.runningPlans.add(plan.id);
+    try {
     plan.status = 'executing';
     await this.plans.save(plan);
     send({ op: 'plan_update', plan: snapshot(plan) });
@@ -114,6 +138,9 @@ export class ExecutorService {
     plan.version++;
     await this.plans.save(plan);
     send({ op: 'plan_update', plan: snapshot(plan) });
+    } finally {
+      this.runningPlans.delete(plan.id);
+    }
   }
 
   async cancel(taskId: string): Promise<void> {
@@ -148,7 +175,7 @@ export class ExecutorService {
     });
 
     // Prefix the agent reply with a task header so the chat is readable.
-    const header = `### 🔧 ${task.id} · ${task.goal}\n\n`;
+    const header = `### ${task.id} · ${task.goal}\n\n`;
     send({ op: 'msg_token', msgId, delta: header });
 
     const status = (line: string) =>
@@ -157,6 +184,11 @@ export class ExecutorService {
     const upstreamContext = collectUpstream(task, plan);
     const recentMsgs = await this.messages.list(plan.conversationId).catch(() => []);
     const recentContext = formatRecentContext(recentMsgs, 10);
+    const conversation = await this.convs.getById(plan.conversationId).catch(() => null);
+    const projectDoc = await this.workspace
+      .readFile(plan.conversationId, { path: 'PROJECT.md', maxBytes: 8_000 })
+      .then((r) => r.content.trim())
+      .catch(() => '');
     await this.projectState.setGoalIfEmpty(plan.conversationId, plan.rootGoal);
     const pState = await this.projectState.load(plan.conversationId);
     const projectMemory = this.projectState.renderForPrompt(pState);
@@ -172,7 +204,8 @@ export class ExecutorService {
       '4. 写完后自己用 terminal_run 跑构建/类型检查验证；报错就继续修，直到通过。\n' +
       '5. **禁止占用 3000 / 4000 端口**（用户本机服务在用）；要起服务用 5173/8080 等其它端口，且优先用会退出的命令（npm run build / tsc）验证，不要长跑 dev server（npm run start / vite 常驻）。\n' +
       '6. 不要急、允许多轮迭代：先打通最小闭环再增强。改了会影响别人的东西（接口契约/文件结构/共享类型）要在回复里 @ 受影响角色对齐；需求不确定且代价大时 @ 用户问清楚再做。\n' +
-      '7. 说明文字简洁；中文回复。任务没真正可运行前不要宣称完成。' +
+      '7. 输出克制：不要 emoji；不要写"我将/首先/接下来/总结/如需请告知"模板句；不要复述工具调用流水账。\n' +
+      '8. 最终正文只写交付结果、关键文件、验证结果和下一步阻塞。任务没真正可运行前不要宣称完成。' +
       (projectMemory ? `\n\n${projectMemory}` : '') +
       (recentContext
         ? `\n\n## 最近对话（工作记忆，越靠下越新）\n\n${recentContext}\n\n` +
@@ -180,6 +213,8 @@ export class ExecutorService {
         : '');
 
     const baseUserMsg =
+      (conversation?.title ? `项目名称：${conversation.title}\n\n` : '') +
+      (projectDoc ? `PROJECT.md 当前内容：\n${projectDoc}\n\n` : '') +
       `任务目标：${task.goal}\n\n` +
       (upstreamContext ? `${upstreamContext}\n\n` : '') +
       `请在工作区里实现本任务（真实写文件 + 自测）。`;
@@ -212,40 +247,56 @@ export class ExecutorService {
     const maxAttempts = maxVerifyAttempts();
     let output = '';
     let agentErrored = false;
+    let lastAgentError: AdapterErrorPayload | undefined;
     let lastFailure: string | null = null;
 
     try {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (attempt > 1) {
-          status(`🔁 第 ${attempt}/${maxAttempts} 轮：根据真实报错修复中…`);
+          status(`第 ${attempt}/${maxAttempts} 轮：根据真实报错修复`);
         }
 
-        const run = await this.toolRunner.run({
-          adapter,
-          request: baseReq(),
-          conversationId: plan.conversationId,
-          msgId,
-          send,
-          signal: ctrl.signal,
-          maxToolRounds: maxToolRoundsPerAttempt(),
-          // Keep the message in streaming state across all verification
-          // rounds so the live activity feed stays visible (not collapsed
-          // to a "done" thinking block mid-task). We emit the single final
-          // msg_done ourselves below.
-          suppressDone: true,
-        });
-        output = run.output;
-        agentErrored = run.errored;
+        for (let streamAttempt = 1; streamAttempt <= maxAgentStreamAttempts(); streamAttempt++) {
+          const run = await this.toolRunner.run({
+            adapter,
+            request: baseReq(),
+            conversationId: plan.conversationId,
+            msgId,
+            send,
+            signal: ctrl.signal,
+            maxToolRounds: maxToolRoundsPerAttempt(),
+            // Keep the message in streaming state across all verification
+            // rounds so the live activity feed stays visible (not collapsed
+            // to a "done" thinking block mid-task). We emit the single final
+            // msg_done ourselves below.
+            suppressDone: true,
+            suppressRetryableErrors: true,
+          });
+          output = run.output || output;
+          agentErrored = run.errored;
+          lastAgentError = run.error;
+
+          if (!agentErrored) break;
+          if (ctrl.signal.aborted || !isRetryableAgentError(lastAgentError) || streamAttempt >= maxAgentStreamAttempts()) {
+            break;
+          }
+          status(
+            `Agent stream interrupted (${lastAgentError?.code ?? 'ERROR'}); retrying ${streamAttempt + 1}/${maxAgentStreamAttempts()}`,
+          );
+          await sleep(600 * streamAttempt);
+        }
 
         if (agentErrored) {
-          // The tool-runner already surfaced the error (incl. idle timeout).
+          if (lastAgentError) {
+            send({ op: 'msg_error', msgId, error: lastAgentError });
+          }
           break;
         }
 
         if (!verify) {
           // Nothing mechanically verifiable (static HTML, docs, manual).
           // Fall back to the lenient, now-timeout-guarded critic LLM.
-          status('🔍 无可机检命令，走 Critic 轻量审查…');
+          status('无可机检命令，进行轻量审查');
           const verdict = await this.critic.judge(task, output);
           if (verdict.verdict === 'PASS') {
             lastFailure = null;
@@ -265,7 +316,7 @@ export class ExecutorService {
         const result = await this.runVerification(plan.conversationId, verify, status);
         if (result.ok) {
           lastFailure = null;
-          status(`✅ 验证通过：${verify.label}`);
+          status(`验证通过：${verify.label}`);
           break;
         }
 
@@ -307,14 +358,16 @@ export class ExecutorService {
         note: '执行 Agent 报错',
       });
       this.markTask(plan, task, 'failed', send, {
-        code: 'AGENT_ERROR',
-        message: '执行 Agent 报错（见会话内的报错信息）',
+        code: lastAgentError?.code ?? 'AGENT_ERROR',
+        message: lastAgentError
+          ? `${lastAgentError.message} (automatic stream retries exhausted)`
+          : 'Agent execution failed; see the chat message above.',
       });
       return;
     }
 
     if (lastFailure) {
-      status(`❌ 用尽 ${maxAttempts} 轮仍未通过验证，任务失败。`);
+      status(`用尽 ${maxAttempts} 轮仍未通过验证，任务失败。`);
       void this.projectState.recordOutcome(plan.conversationId, {
         kind: 'blocked',
         taskId: task.id,
@@ -387,7 +440,7 @@ export class ExecutorService {
     status: (line: string) => void,
   ): Promise<{ ok: true } | { ok: false; command: string; exitCode: number | null; detail: string }> {
     if (plan.setup) {
-      status(`📦 安装依赖：${plan.setup}`);
+      status(`安装依赖：${plan.setup}`);
       const dep = await this.workspace.runCommand(conversationId, {
         command: plan.setup,
         timeoutMs: 600_000,
@@ -402,7 +455,7 @@ export class ExecutorService {
       }
     }
 
-    status(`🔍 验证：${plan.label}`);
+    status(`验证：${plan.label}`);
     const res = await this.workspace.runCommand(conversationId, {
       command: plan.verify,
       timeoutMs: 300_000,
@@ -476,6 +529,7 @@ export class ExecutorService {
   ): void {
     task.status = status;
     if (error) task.error = error;
+    else if (status !== 'failed') task.error = undefined;
     plan.updatedAt = new Date().toISOString();
     plan.version++;
     void this.plans.save(plan);
@@ -486,6 +540,11 @@ export class ExecutorService {
 function isReady(task: PlanTask, byId: Map<string, PlanTask>): boolean {
   if (task.status !== 'pending' && task.status !== 'ready') return false;
   return task.inputs.every((u) => byId.get(u)?.status === 'succeeded');
+}
+
+function isRetryableAgentError(error: AdapterErrorPayload | undefined): boolean {
+  if (!error) return false;
+  return error.retryable || (error.code === 'CANCELLED' && /aborted/i.test(error.message));
 }
 
 /**

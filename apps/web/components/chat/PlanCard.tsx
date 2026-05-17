@@ -13,6 +13,7 @@ import {
   Loader2,
   Pencil,
   Plus,
+  RotateCcw,
   Sparkles,
   Trash2,
   X,
@@ -56,6 +57,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const editPlan = useConversationStore((s) => s.editPlan);
+  const retryTask = useConversationStore((s) => s.retryTask);
   const editable = plan.status !== 'executing'; // editing live plans is risky; lock during exec
 
   return (
@@ -123,6 +125,7 @@ export function PlanCard({ plan }: { plan: Plan }) {
                 agents={assignableAgents}
                 editMode={editMode}
                 onEdit={() => setEditingId(task.id)}
+                onRetry={() => retryTask(plan.id, task.id)}
                 onDelete={() => {
                   if (!confirm(`确认删除 ${task.id} (${task.goal.slice(0, 30)}…)？所有下游任务将失去对它的依赖。`))
                     return;
@@ -169,12 +172,14 @@ function TaskRow({
   agents,
   editMode,
   onEdit,
+  onRetry,
   onDelete,
 }: {
   task: PlanTask;
   agents: Array<{ id: string; name: string; avatarColor: string }>;
   editMode: boolean;
   onEdit: () => void;
+  onRetry: () => void;
   onDelete: () => void;
 }) {
   const profile = task.assigneeAgentId ? agents.find((a) => a.id === task.assigneeAgentId) : undefined;
@@ -186,6 +191,7 @@ function TaskRow({
     (task.assigneeAgentId
       ? roleColorFor(task.assigneeAgentId, AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280')
       : '#6b7280');
+  const retryable = task.status === 'failed' || task.status === 'cancelled';
 
   return (
     <div
@@ -262,8 +268,19 @@ function TaskRow({
             </div>
           ) : null}
         </div>
-        {editMode ? (
+        {editMode || retryable ? (
           <div className="flex shrink-0 items-center gap-0.5 opacity-70 group-hover:opacity-100">
+            {retryable ? (
+              <button
+                onClick={onRetry}
+                className="rounded p-1 text-amber-300/80 hover:bg-amber-500/10 hover:text-amber-200"
+                title="Retry this task"
+              >
+                <RotateCcw className="h-3 w-3" />
+              </button>
+            ) : null}
+            {editMode ? (
+              <>
             <button
               onClick={onEdit}
               className="rounded p-1 text-text-muted hover:bg-white/10 hover:text-text"
@@ -278,6 +295,8 @@ function TaskRow({
             >
               <Trash2 className="h-3 w-3" />
             </button>
+              </>
+            ) : null}
           </div>
         ) : null}
       </div>
