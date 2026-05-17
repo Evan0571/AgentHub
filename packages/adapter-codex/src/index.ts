@@ -93,37 +93,52 @@ export class CodexAdapter implements AgentAdapter {
     };
 
     let response: Response;
-    try {
-      response = await fetch(`${this.baseURL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-          ...(this.organization ? { 'OpenAI-Organization': this.organization } : {}),
-        },
-        body: JSON.stringify(body),
-        signal,
-      });
-    } catch (e) {
-      if (signal?.aborted) {
-        yield {
-          type: 'error',
-          error: { code: 'CANCELLED', message: 'aborted', retryable: false },
-        };
+    // 429 (TPM rate limit) is extremely common when several gpt-4o agents
+    // run in parallel on a low-quota key. OpenAI tells us exactly how long
+    // to wait ("try again in Xs" / Retry-After header) — honor it and retry
+    // in-adapter instead of failing the whole task.
+    const maxRateRetries = 5;
+    let rateAttempt = 0;
+    while (true) {
+      try {
+        response = await fetch(`${this.baseURL}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream',
+            ...(this.organization ? { 'OpenAI-Organization': this.organization } : {}),
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+      } catch (e) {
+        if (signal?.aborted) {
+          yield {
+            type: 'error',
+            error: { code: 'CANCELLED', message: 'aborted', retryable: false },
+          };
+          return;
+        }
+        yield new AdapterError({
+          code: 'INTERNAL',
+          message: `fetch failed: ${(e as Error).message}`,
+          retryable: true,
+          cause: e,
+        }).toEvent();
         return;
       }
-      yield new AdapterError({
-        code: 'INTERNAL',
-        message: `fetch failed: ${(e as Error).message}`,
-        retryable: true,
-        cause: e,
-      }).toEvent();
-      return;
-    }
 
-    if (!response.ok || !response.body) {
+      if (response.ok && response.body) break;
+
       const text = await safeText(response);
+      const isRate = response.status === 429;
+      if (isRate && rateAttempt < maxRateRetries && !signal?.aborted) {
+        rateAttempt++;
+        const waitMs = parseRetryWaitMs(response, text, rateAttempt);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
       yield new AdapterError({
         code: mapHttpStatus(response.status),
         message: `OpenAI ${response.status}: ${text}`,
@@ -312,6 +327,30 @@ async function safeText(r: Response): Promise<string> {
   } catch {
     return '';
   }
+}
+
+/**
+ * How long to wait before retrying a 429. Prefers OpenAI's own guidance:
+ *   1. `Retry-After` header (seconds)
+ *   2. "Please try again in 4.866s" / "in 500ms" inside the body
+ *   3. exponential-ish fallback by attempt number
+ * A small jitter + cap avoids thundering-herd when many agents retry together.
+ */
+function parseRetryWaitMs(res: Response, body: string, attempt: number): number {
+  const header = res.headers.get('retry-after');
+  let ms = 0;
+  if (header && Number.isFinite(Number(header))) {
+    ms = Number(header) * 1000;
+  } else {
+    const m = /try again in\s+([\d.]+)\s*(ms|s)/i.exec(body);
+    if (m) {
+      const v = Number(m[1]);
+      ms = (m[2] ?? 's').toLowerCase() === 'ms' ? v : v * 1000;
+    }
+  }
+  if (!ms || !Number.isFinite(ms)) ms = Math.min(2000 * 2 ** (attempt - 1), 30_000);
+  // pad a bit so we don't retry exactly on the boundary, cap at 60s.
+  return Math.min(ms + 500 + Math.floor(Math.random() * 400), 60_000);
 }
 
 function safeJSON(s: unknown): unknown {

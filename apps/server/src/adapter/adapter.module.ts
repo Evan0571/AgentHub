@@ -12,6 +12,8 @@ import { DeepSeekAdapter } from '@agenthub/adapter-deepseek';
 import { DoubaoAdapter } from '@agenthub/adapter-doubao';
 import { TracingService } from '../observability/tracing.service.js';
 import { withLangfuse } from '../observability/adapter-tracing.js';
+import { withUsage } from '../observability/usage-middleware.js';
+import { UsageRepo } from '../db/usage.repo.js';
 import { AdapterFactoryService } from './adapter.factory.js';
 import { ADAPTER_REGISTRY } from './constants.js';
 
@@ -20,12 +22,17 @@ import { ADAPTER_REGISTRY } from './constants.js';
   providers: [
     {
       provide: ADAPTER_REGISTRY,
-      inject: [TracingService],
-      useFactory: (tracing: TracingService) => {
+      inject: [TracingService, UsageRepo],
+      useFactory: (tracing: TracingService, usage: UsageRepo) => {
         const registry = new AdapterRegistry();
-        // Order matters: langfuse OUTSIDE retry so retried calls each show as
-        // separate generations; logging OUTSIDE everything for full visibility.
-        const wrap = compose(withLogging, withLangfuse(tracing), withRetry({ max: 2 }));
+        // Order matters: usage + langfuse OUTSIDE retry so each retried call is
+        // accounted/traced separately; logging OUTSIDE everything.
+        const wrap = compose(
+          withLogging,
+          withLangfuse(tracing),
+          withUsage(usage, tracing),
+          withRetry({ max: 2 }),
+        );
 
         // Mock is always available (zero-config demo fallback).
         registry.register(wrap(new MockAdapter()));

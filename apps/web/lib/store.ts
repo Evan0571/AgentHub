@@ -56,6 +56,53 @@ export function baseRoleIdFromConvAgent(id: string): string | null {
   return m?.[1] ?? null;
 }
 
+/** Built-in role id → human label, so UI never shows raw conv-agent ids. */
+const ROLE_LABELS: Record<string, string> = {
+  'team-lead': '组长',
+  'product-analyst': '产品分析师',
+  'solution-architect': '架构师',
+  'frontend-engineer': '前端工程师',
+  'backend-engineer': '后端工程师',
+  'code-reviewer': 'Code Reviewer',
+  'env-engineer': '环境配置员',
+  'qa-tester': '测试员',
+  'senior-user': '资深用户',
+  'risk-critic': '风险审视员',
+};
+
+/** Role id → avatar color, mirrors the seeded built-in agents (server). */
+export const ROLE_COLORS: Record<string, string> = {
+  'team-lead': '#f59e0b',
+  'product-analyst': '#0f766e',
+  'solution-architect': '#1d4ed8',
+  'frontend-engineer': '#db2777',
+  'backend-engineer': '#0891b2',
+  'code-reviewer': '#9333ea',
+  'env-engineer': '#475569',
+  'qa-tester': '#ca8a04',
+  'senior-user': '#16a34a',
+  'risk-critic': '#dc2626',
+};
+
+/** Avatar color for any agent id (resolves conv-agent → base role color). */
+export function roleColorFor(agentId: string, fallback = '#6b7280'): string {
+  const baseRole = baseRoleIdFromConvAgent(agentId) ?? agentId;
+  return ROLE_COLORS[baseRole] ?? fallback;
+}
+
+/**
+ * Always return something a human can read. Prefer a real name; if the name
+ * is missing or is itself the raw conv-agent id, derive the role label from
+ * the id suffix.
+ */
+export function prettyAgentName(agentId: string, rawName?: string): string {
+  if (rawName && rawName.trim() && !rawName.startsWith('conv-agent-') && rawName !== agentId) {
+    return rawName;
+  }
+  const baseRole = baseRoleIdFromConvAgent(agentId) ?? agentId;
+  return ROLE_LABELS[baseRole] ?? baseRole;
+}
+
 export interface ChatConversation {
   id: string;
   title: string;
@@ -73,7 +120,41 @@ export interface ChatConversation {
   preview?: string;
 }
 
-export type RightPanelTab = 'workspace' | 'plan' | 'preview' | 'deploy';
+export type RightPanelTab = 'workspace' | 'plan' | 'preview' | 'deploy' | 'usage';
+
+export interface ModelUsageRow {
+  adapterId: string;
+  model: string | null;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface ConversationUsage {
+  conversationId: string;
+  totals: {
+    calls: number;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    costUsd: number;
+  };
+  byModel: ModelUsageRow[];
+}
+
+export interface AgentTerminalEntry {
+  id: string;
+  agentName: string;
+  command: string;
+  cwd: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  createdAt: string;
+}
 
 export interface Deployment {
   deploymentId: string;
@@ -92,6 +173,8 @@ interface State {
   messagesByConv: Record<string, ChatMessage[]>;
   plansByConv: Record<string, Plan>;
   deploymentsByConv: Record<string, Deployment[]>;
+  usageByConv: Record<string, ConversationUsage>;
+  agentTerminalByConv: Record<string, AgentTerminalEntry[]>;
   rightPanelTab: RightPanelTab;
   /** uid of the code block selected for preview; null = auto-pick latest runnable. */
   previewBlockUid: string | null;
@@ -124,6 +207,7 @@ interface State {
   // ----- conversation / member / agent management ---------------------
   refreshAgents: () => Promise<void>;
   refreshConversations: () => Promise<void>;
+  fetchUsage: (conversationId: string) => Promise<void>;
   createConversation: (input: {
     type: 'single' | 'group';
     title: string;
@@ -271,8 +355,22 @@ function inferMentions(conv: ChatConversation | undefined, text: string): string
   const memberIds = new Set(conv.members.map((m) => m.agentId));
   const explicit = new Set<string>();
   for (const m of text.matchAll(/@([\w-]+)/g)) {
-    const id = m[1];
-    if (id && memberIds.has(id) && !isHiddenSystemAgentId(id)) explicit.add(id);
+    const token = m[1];
+    if (!token) continue;
+    // Direct match (full agentId), else resolve a short role token like
+    // `solution-architect` to this conversation's conv-agent member.
+    let id: string | undefined;
+    if (memberIds.has(token)) id = token;
+    else {
+      const hit = conv.members.find(
+        (mm) =>
+          mm.agentId === token ||
+          mm.agentId.endsWith(`-${token}`) ||
+          baseRoleIdFromConvAgent(mm.agentId) === token,
+      );
+      id = hit?.agentId;
+    }
+    if (id && !isHiddenSystemAgentId(id)) explicit.add(id);
   }
   if (explicit.size > 0) return [...explicit];
 
@@ -285,87 +383,12 @@ function inferMentions(conv: ChatConversation | undefined, text: string): string
     return [defaultSingleAgent ?? 'deepseek-v4-flash'];
   }
 
-  const normalized = text.toLowerCase();
-  const has = (patterns: RegExp[]) => patterns.some((re) => re.test(normalized));
-  const pick = (ids: string[], namePattern?: RegExp): string | undefined => {
-    for (const id of ids) {
-      if (memberIds.has(id) && !isHiddenSystemAgentId(id)) return id;
-    }
-    if (namePattern) {
-      const member = conv.members.find((m) =>
-        !isHiddenSystemAgentId(m.agentId) && namePattern.test(`${m.name} ${m.agentId} ${m.adapterId}`),
-      );
-      return member?.agentId;
-    }
-    return undefined;
-  };
-
-  // Only hand off to the project planner when it's clearly a *whole-project*
-  // ask. Previously a single "实现登录接口" hijacked the route because any one
-  // of three loose groups matched. Now we require either:
-  //   (a) an action verb co-occurring with a project-scope noun
-  //       ("做一个待办应用"、"搭建一个电商系统"), or
-  //   (b) an explicit planning / breakdown request ("帮我拆解一下任务").
-  // Single-component requests ("写个登录接口") fall through to role routing.
-  const actionVerb =
-    /做一个|做个|搭一个|搭个|写一个|创建|生成|开发|实现|搭建|构建|build|create|implement|make/;
-  const projectScope =
-    /项目|应用|app|网站|网页|系统|平台|产品|端到端|全栈|full[ -]?stack|project|website|dashboard|platform/;
-  const planningAsk =
-    /拆解|拆分|任务拆|帮我规划|做个规划|项目计划|计划任务|分工|排期|roadmap|break ?down|plan the/;
-  const projectIntent =
-    (actionVerb.test(normalized) && projectScope.test(normalized)) ||
-    planningAsk.test(normalized);
-  if (projectIntent) return [PROJECT_PLANNER_MENTION];
-
-  const roleRoutes: Array<{ patterns: RegExp[]; ids: string[]; name?: RegExp }> = [
-    {
-      patterns: [/前端|界面|ui|ux|页面|组件|样式|css|react|next|动画|preview/],
-      ids: ['frontend-engineer'],
-      name: /前端|frontend|ui/i,
-    },
-    {
-      patterns: [/后端|接口|api|数据库|鉴权|登录|服务端|server|backend|db|auth/],
-      ids: ['backend-engineer'],
-      name: /后端|backend|server/i,
-    },
-    {
-      patterns: [/测试|验证|报错|失败|bug|修复|typecheck|compile|build error|不能运行/],
-      ids: ['qa-tester', 'code-reviewer'],
-      name: /测试|qa|review/i,
-    },
-    {
-      patterns: [/review|审查|代码质量|风险|安全|边界|隐私|漏洞|critic/],
-      ids: ['risk-critic', 'code-reviewer'],
-      name: /风险|review|critic|审查/i,
-    },
-    {
-      patterns: [/部署|环境|terminal|命令|脚本|docker|vercel|env|ci/],
-      ids: ['env-engineer'],
-      name: /环境|devops|部署/i,
-    },
-    {
-      patterns: [/产品|需求|用户|体验|文案|验收|范围|prd/],
-      ids: ['product-analyst', 'senior-user'],
-      name: /产品|用户|analyst|user/i,
-    },
-    {
-      patterns: [/架构|设计|方案|技术选型|模块|数据流|architecture/],
-      ids: ['solution-architect'],
-      name: /架构|architect/i,
-    },
-  ];
-
-  for (const route of roleRoutes) {
-    if (!has(route.patterns)) continue;
-    const id = pick(route.ids, route.name);
-    if (id) return [id];
-  }
-
-  const architect = pick(['solution-architect'], /架构|architect/i);
-  if (architect) return [architect];
-  const firstVisible = conv.members.find((m) => !isHiddenSystemAgentId(m.agentId));
-  return [firstVisible?.agentId ?? 'deepseek-v4-flash'];
+  // Group conversation, no explicit @: everything goes through the 组长
+  // (coordinator). The server-side triage (planner.triage) is the brain —
+  // it decides "dispatch straight to engineers" vs "hand a planning task to
+  // the architect → real Plan DAG". We deliberately do NOT do brittle
+  // keyword routing on the client anymore; the coordinator decides.
+  return [PROJECT_PLANNER_MENTION];
 }
 
 export const useConversationStore = create<State>((set, get) => ({
@@ -374,6 +397,8 @@ export const useConversationStore = create<State>((set, get) => ({
   activeId: null,
   plansByConv: {},
   deploymentsByConv: {},
+  usageByConv: {},
+  agentTerminalByConv: {},
   rightPanelTab: 'workspace',
   previewBlockUid: null,
   banner: null,
@@ -560,6 +585,17 @@ export const useConversationStore = create<State>((set, get) => ({
       if (act) void get().hydrate(act);
     } catch (e) {
       console.warn('[refreshConversations]', e);
+    }
+  },
+
+  fetchUsage: async (conversationId) => {
+    try {
+      const r = await fetch(apiUrl(`/api/conversations/${encodeURIComponent(conversationId)}/usage`));
+      if (!r.ok) throw new Error(`usage ${r.status}`);
+      const data = (await r.json()) as ConversationUsage;
+      set((s) => ({ usageByConv: { ...s.usageByConv, [conversationId]: data } }));
+    } catch (e) {
+      console.warn('[fetchUsage]', e);
     }
   },
 
@@ -827,6 +863,27 @@ function handleServerEvent(
         deploymentsByConv: { ...s.deploymentsByConv, [convId]: next },
         rightPanelTab:
           existing < 0 && get().activeId === convId ? 'deploy' : s.rightPanelTab,
+      }));
+      return;
+    }
+    case 'agent_terminal': {
+      const cid = ev.conversationId;
+      const entry: AgentTerminalEntry = {
+        id: 'at' + Date.now() + Math.random().toString(36).slice(2, 6),
+        agentName: ev.agentName,
+        command: ev.command,
+        cwd: ev.cwd,
+        stdout: ev.stdout,
+        stderr: ev.stderr,
+        exitCode: ev.exitCode,
+        timedOut: ev.timedOut,
+        createdAt: ev.createdAt,
+      };
+      set((s) => ({
+        agentTerminalByConv: {
+          ...s.agentTerminalByConv,
+          [cid]: [...(s.agentTerminalByConv[cid] ?? []), entry].slice(-200),
+        },
       }));
       return;
     }

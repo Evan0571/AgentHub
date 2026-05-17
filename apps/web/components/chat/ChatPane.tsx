@@ -1,10 +1,10 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, AtSign, FileText, Image as ImageIcon, Loader2, Paperclip, X } from 'lucide-react';
+import { Send, AtSign, Download, FileText, Image as ImageIcon, Loader2, Paperclip, X } from 'lucide-react';
 import type { MessageAttachment } from '@agenthub/shared-types';
 import { MessageList } from './MessageList';
-import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
+import { baseRoleIdFromConvAgent, isHiddenSystemAgentId, prettyAgentName, useConversationStore } from '@/lib/store';
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
 import { Banner } from '../Banner';
 import { MembersPanel } from './MembersPanel';
@@ -26,6 +26,9 @@ export function ChatPane() {
   );
   const sendUserMessage = useConversationStore((s) => s.sendUserMessage);
   const hydrate = useConversationStore((s) => s.hydrate);
+  const allMessages = useConversationStore((s) =>
+    s.activeId ? s.messagesByConv[s.activeId] : undefined,
+  );
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -59,11 +62,26 @@ export function ChatPane() {
     if (active?.id) void hydrate(active.id);
   }, [active?.id, hydrate]);
 
+  // Auto-grow the composer up to a max height so long / multi-line text is
+  // readable. MUST stay above the early `return` below — it's a hook.
+  const autoGrow = () => {
+    const ta = inputRef.current;
+    if (!ta) return;
+    // Canonical reliable autosize: collapse to 0 so scrollHeight reflects the
+    // TRUE content height (not a stale / flex-stretched value), read it
+    // synchronously (forces reflow), then set. No rAF, no 'auto' — that
+    // combo is what produced the stuck tall/empty box.
+    ta.style.height = '0px';
+    const next = Math.min(Math.max(ta.scrollHeight, 36), 240);
+    ta.style.height = next + 'px';
+  };
+  useEffect(autoGrow, [text]);
+
   const candidates: MentionCandidate[] = useMemo(() => {
     if (!active) return [];
     return active.members.filter((m) => !isHiddenSystemAgentId(m.agentId)).map((m) => ({
       id: m.agentId,
-      name: m.name,
+      name: prettyAgentName(m.agentId, m.name),
       color: m.avatarColor,
       hint: describe(m.adapterId),
     }));
@@ -117,7 +135,10 @@ export function ChatPane() {
     if (!mention) return;
     const before = text.slice(0, mention.triggerIdx);
     const after = text.slice(mention.triggerIdx + 1 + mention.query.length);
-    const inserted = `@${c.id} `;
+    // Insert the short role token (e.g. @solution-architect) instead of the
+    // raw conv-agent UUID; the store resolves it back to the real member id.
+    const token = baseRoleIdFromConvAgent(c.id) ?? c.id;
+    const inserted = `@${token} `;
     const next = before + inserted + after;
     setText(next);
     setMention(null);
@@ -130,6 +151,64 @@ export function ChatPane() {
         ta.setSelectionRange(pos, pos);
       }
     });
+  };
+
+  const onExportTranscript = () => {
+    if (!active) return;
+    const msgs = allMessages ?? [];
+    const lines: string[] = [];
+    lines.push(`# 会话导出：${active.title}`);
+    lines.push('');
+    lines.push(
+      `- 类型：${active.type === 'group' ? '群聊' : '单聊'}　- 成员：${active.members
+        .map((m) => `${m.name}(${m.adapterId})`)
+        .join('，')}`,
+    );
+    lines.push(`- 导出时间：${new Date().toLocaleString()}　- 消息数：${msgs.length}`);
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    for (const m of msgs) {
+      const ts = (() => {
+        try {
+          return new Date(m.createdAt).toLocaleTimeString();
+        } catch {
+          return m.createdAt;
+        }
+      })();
+      lines.push(`## ${m.senderName} · ${m.senderType} · ${ts}`);
+      lines.push('');
+      if (m.thinking && m.thinking.trim()) {
+        lines.push('<details><summary>思考过程 / 工具活动</summary>');
+        lines.push('');
+        lines.push('```');
+        lines.push(m.thinking.trim());
+        lines.push('```');
+        lines.push('');
+        lines.push('</details>');
+        lines.push('');
+      }
+      lines.push(m.text && m.text.trim() ? m.text : '_(无正文)_');
+      if (m.attachments && m.attachments.length > 0) {
+        lines.push('');
+        lines.push(
+          `附件：${m.attachments.map((a) => `${a.name} (${a.kind}, ${a.size}B)`).join('；')}`,
+        );
+      }
+      lines.push('');
+      lines.push('---');
+      lines.push('');
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const safe = active.title.replace(/[^\w一-龥-]+/g, '_').slice(0, 40);
+    a.href = url;
+    a.download = `agenthub-${safe}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const onSend = () => {
@@ -276,12 +355,22 @@ export function ChatPane() {
         <div className="flex h-8 w-8 items-center justify-center rounded bg-accent/20 text-accent font-semibold">
           {active.title[0]}
         </div>
-        <div>
-          <div className="font-medium">{active.title}</div>
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-medium">{active.title}</div>
           <div className="text-xs text-text-muted">
             {visibleMembers.length} 个成员 · {active.type === 'group' ? '群聊' : '单聊'}
           </div>
         </div>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onExportTranscript();
+          }}
+          className="rounded p-1.5 text-text-muted hover:bg-white/5 hover:text-text"
+          title="导出本群完整对话（Markdown，发给我用）"
+        >
+          <Download className="h-4 w-4" />
+        </button>
       </header>
 
       <MessageList conversationId={active.id} />
@@ -362,7 +451,7 @@ export function ChatPane() {
                 ? '输入消息，@ 选择 Agent；Enter 发送 / Shift+Enter 换行'
                 : '输入消息，Enter 发送 / Shift+Enter 换行'
             }
-            className="max-h-40 min-h-[1.5rem] flex-1 resize-none bg-transparent text-sm outline-none placeholder:text-text-muted"
+            className="max-h-[240px] min-h-[1.5rem] flex-1 resize-none overflow-y-auto bg-transparent text-sm leading-relaxed outline-none placeholder:text-text-muted"
           />
           <button
             onClick={onSend}

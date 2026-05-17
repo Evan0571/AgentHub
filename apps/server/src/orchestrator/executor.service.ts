@@ -10,8 +10,13 @@ import { AgentsRepo } from '../db/agents.repo.js';
 import { ConversationsRepo } from '../db/conversations.repo.js';
 import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
 import { WorkspaceService } from '../workspace/workspace.service.js';
+import { ProjectStateService } from '../workspace/project-state.service.js';
 
-const MAX_PARALLEL = 4;
+// Most conv-agents share one OpenAI key with a low TPM (e.g. 30k/min on
+// gpt-4o trial orgs). Running 4 heavy tasks at once instantly blows the
+// per-minute token budget → 429 → task failure. 2 keeps throughput while
+// staying under typical limits; the Codex adapter also honors Retry-After.
+const MAX_PARALLEL = Math.max(1, Number(process.env.AGENTHUB_MAX_PARALLEL ?? 2) || 2);
 /** How many times we re-run the agent feeding back the REAL verification error. */
 function maxVerifyAttempts(): number {
   const raw = Number(process.env.AGENTHUB_MAX_VERIFY_ATTEMPTS ?? 5);
@@ -46,6 +51,7 @@ export class ExecutorService {
     private readonly adapterFactory: AdapterFactoryService,
     private readonly toolRunner: AgentToolRunnerService,
     private readonly workspace: WorkspaceService,
+    private readonly projectState: ProjectStateService,
   ) {}
 
   /**
@@ -149,6 +155,11 @@ export class ExecutorService {
       send({ op: 'msg_thinking', msgId, delta: `\n${line}\n` });
 
     const upstreamContext = collectUpstream(task, plan);
+    const recentMsgs = await this.messages.list(plan.conversationId).catch(() => []);
+    const recentContext = formatRecentContext(recentMsgs, 10);
+    await this.projectState.setGoalIfEmpty(plan.conversationId, plan.rootGoal);
+    const pState = await this.projectState.load(plan.conversationId);
+    const projectMemory = this.projectState.renderForPrompt(pState);
     const baseSystemPrompt =
       (assignee.systemPrompt
         ? `## 你的角色：${assignee.name}\n\n${assignee.systemPrompt.trim()}\n\n`
@@ -159,7 +170,14 @@ export class ExecutorService {
       '2. 需要上游产物时，用 workspace_read / workspace_list 读**真实文件**，不要凭记忆猜上游的接口/路径。\n' +
       '3. **绝不允许半截或省略**：所有函数、事件处理、闭合标签都要写完整。不要写 "// 省略" / "其余同理"。\n' +
       '4. 写完后自己用 terminal_run 跑构建/类型检查验证；报错就继续修，直到通过。\n' +
-      '5. 说明文字简洁；中文回复。任务没真正可运行前不要宣称完成。';
+      '5. **禁止占用 3000 / 4000 端口**（用户本机服务在用）；要起服务用 5173/8080 等其它端口，且优先用会退出的命令（npm run build / tsc）验证，不要长跑 dev server（npm run start / vite 常驻）。\n' +
+      '6. 不要急、允许多轮迭代：先打通最小闭环再增强。改了会影响别人的东西（接口契约/文件结构/共享类型）要在回复里 @ 受影响角色对齐；需求不确定且代价大时 @ 用户问清楚再做。\n' +
+      '7. 说明文字简洁；中文回复。任务没真正可运行前不要宣称完成。' +
+      (projectMemory ? `\n\n${projectMemory}` : '') +
+      (recentContext
+        ? `\n\n## 最近对话（工作记忆，越靠下越新）\n\n${recentContext}\n\n` +
+          `用户可能在过程中补充或修改了要求 —— 以最新的为准。`
+        : '');
 
     const baseUserMsg =
       `任务目标：${task.goal}\n\n` +
@@ -210,6 +228,11 @@ export class ExecutorService {
           send,
           signal: ctrl.signal,
           maxToolRounds: maxToolRoundsPerAttempt(),
+          // Keep the message in streaming state across all verification
+          // rounds so the live activity feed stays visible (not collapsed
+          // to a "done" thinking block mid-task). We emit the single final
+          // msg_done ourselves below.
+          suppressDone: true,
         });
         output = run.output;
         agentErrored = run.errored;
@@ -271,7 +294,18 @@ export class ExecutorService {
       })
       .catch(() => undefined);
 
+    // Single terminal msg_done for the whole task (all verification rounds).
+    // toolRunner ran with suppressDone:true so the message stayed streaming
+    // and the live activity feed was visible the entire time.
+    send({ op: 'msg_done', msgId });
+
     if (agentErrored) {
+      void this.projectState.recordOutcome(plan.conversationId, {
+        kind: 'blocked',
+        taskId: task.id,
+        goal: task.goal,
+        note: '执行 Agent 报错',
+      });
       this.markTask(plan, task, 'failed', send, {
         code: 'AGENT_ERROR',
         message: '执行 Agent 报错（见会话内的报错信息）',
@@ -281,6 +315,12 @@ export class ExecutorService {
 
     if (lastFailure) {
       status(`❌ 用尽 ${maxAttempts} 轮仍未通过验证，任务失败。`);
+      void this.projectState.recordOutcome(plan.conversationId, {
+        kind: 'blocked',
+        taskId: task.id,
+        goal: task.goal,
+        note: lastFailure.slice(0, 160),
+      });
       this.markTask(plan, task, 'failed', send, {
         code: 'VERIFY_FAILED',
         message: lastFailure.slice(0, 500),
@@ -288,6 +328,11 @@ export class ExecutorService {
       return;
     }
 
+    void this.projectState.recordOutcome(plan.conversationId, {
+      kind: 'done',
+      taskId: task.id,
+      goal: task.goal,
+    });
     task.artifactRefs = { messageId: msgId };
     task.finishedAt = new Date().toISOString();
     task.criticFeedback = undefined;
@@ -449,6 +494,22 @@ function isReady(task: PlanTask, byId: Map<string, PlanTask>): boolean {
  * the shared workspace — so we just tell the agent which tasks finished and a
  * one-line gist, and instruct it to `workspace_read` the actual files.
  */
+/** Compact transcript of the last N messages — conversation working memory. */
+function formatRecentContext(
+  msgs: Array<{ senderType: string; senderId: string; text: string }>,
+  limit: number,
+): string {
+  if (msgs.length === 0) return '';
+  return msgs
+    .slice(-limit)
+    .map((m) => {
+      const who = m.senderType === 'user' ? '用户' : m.senderType === 'system' ? '系统' : m.senderId;
+      const t = m.text.replace(/```[\s\S]*?```/g, ' [代码块] ').replace(/\s+/g, ' ').trim();
+      return `[${who}] ${t.length > 240 ? t.slice(0, 240) + '…' : t}`;
+    })
+    .join('\n');
+}
+
 function collectUpstream(task: PlanTask, plan: Plan): string {
   const parts: string[] = [];
   for (const id of task.inputs) {

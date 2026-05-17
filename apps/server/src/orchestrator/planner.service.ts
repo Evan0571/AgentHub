@@ -56,10 +56,16 @@ export class PlannerService {
 
     const userMsg =
       `根目标：${input.rootGoal}\n\n` +
-      `可用 Agent（id：能力）：\n` +
+      `可用 Agent（必须从这些 id 里选 candidateAgents，禁止编造其它 id）：\n` +
       catalog.text +
       `\n\n` +
-      `请直接输出 Plan JSON，禁止额外文字。`;
+      `要求：\n` +
+      `- 任务要**针对这个具体项目**拆解（用到项目里的真实功能/模块名），不要输出"定义产品目标""设计文件结构"这种放之四海皆准的空壳。\n` +
+      `- 先 MVP 再扩展：第一批任务交付一个能跑起来的最小闭环，后续任务再加增强功能，不要一个任务想做完所有事。\n` +
+      `- **全员覆盖**：上面列出的每一个 agent（组长 team-lead 除外）都必须**至少被分配到 1 个任务**（写进它的 candidateAgents）。不要让任何成员闲置——前端/后端/测试/审查/环境/产品/资深用户/风险审视都要有活干，必要时为某个角色单开一个任务（如测试员→写并跑测试，风险审视员→安全/边界审查，资深用户→可用性走查）。\n` +
+      `- **允许迭代**：这个项目通常一轮做不完。可以规划"第一轮 MVP → 验证 → 第二轮增强 → 再验证"这样的多阶段任务（用 inputs 表达依赖），不要假设一次就交付完整成品。\n` +
+      `- 每个任务的 candidateAgents 必须来自上面的 id 列表。\n` +
+      `- 只输出一个 JSON 对象，不要 markdown 代码围栏、不要任何解释文字。`;
 
     let raw = '';
     try {
@@ -78,7 +84,10 @@ export class PlannerService {
           plannerPrompt.systemPrompt,
         ].filter(Boolean).join('\n\n'),
         messages: [{ role: 'user', content: userMsg }],
-        budget: { maxTokens: 800 },
+        // 800 was the bug: a real plan (details/deliverables/checklist for
+        // several tasks) is easily 2k+ tokens → JSON truncated → extractJson
+        // fails → cannedPlan every time (the identical T1-T5 the user saw).
+        budget: { maxTokens: 4000 },
       };
       for await (const ev of adapter.chat(req)) {
         if (ev.type === 'token') raw += ev.text;
@@ -99,6 +108,109 @@ export class PlannerService {
     }
 
     return this.normalize(parsed, input, catalog.ids);
+  }
+
+  /**
+   * Lightweight intent triage done by the architect BEFORE auto-planning.
+   *   - 'plan'     : a whole project / large change → decompose into a DAG.
+   *   - 'dispatch' : a small/scoped change → hand straight to specific
+   *                  engineers (targets = conversation member agentIds).
+   * Fail-open to 'plan' so a triage hiccup never silently drops the request.
+   */
+  async triage(input: {
+    conversationId: string;
+    text: string;
+    recentContext: string;
+  }): Promise<{ mode: 'plan' | 'dispatch'; targets: string[]; brief: string }> {
+    const fallback = { mode: 'plan' as const, targets: [] as string[], brief: input.text };
+    const catalog = await this.agentCatalog(input.conversationId);
+    const memberIds = [...catalog.ids].filter((id) => id !== 'orchestrator' && id !== 'mock');
+    if (memberIds.length === 0) return fallback;
+
+    const plannerAgent = await this.resolvePlannerAgent(input.conversationId);
+    const adapter = plannerAgent?.adapter ?? this.pickAdapter();
+    if (!adapter) return fallback;
+
+    const sys =
+      `你是项目组长（团队调度大脑），负责"分流"用户消息。只输出一个 JSON，无任何解释、无 markdown 围栏。\n\n` +
+      `判定规则：\n` +
+      `- 用户要"做一个完整项目 / 从零搭建 / 全栈 / 大重构 / 多模块" → mode="plan"。\n` +
+      `- 用户是"小改动 / 修个 bug / 加个按钮 / 调样式 / 解释 / 跑个命令 / 端口冲突"等 → mode="dispatch"，并从下面成员里选 1-3 个最合适的 agentId 放进 targets，brief 写清楚要他们做什么。\n` +
+      `- 不确定时倾向 dispatch（更轻、更快），除非明显是大项目。\n\n` +
+      `可选成员（targets 只能从这些 id 选）：\n${catalog.text}\n\n` +
+      `输出格式：{"mode":"plan"|"dispatch","targets":["<agentId>"],"brief":"<给执行者的一句话指令>"}`;
+
+    const userMsg =
+      (input.recentContext ? `最近对话（供判断上下文）：\n${input.recentContext}\n\n` : '') +
+      `用户最新消息：\n${input.text}`;
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 25_000);
+    let raw = '';
+    try {
+      const req: ChatRequest = {
+        taskId: 'triage-' + Date.now(),
+        metadata: { purpose: 'triage', conversationId: input.conversationId },
+        systemPrompt: sys,
+        messages: [{ role: 'user', content: userMsg }],
+        budget: { maxTokens: 400 },
+      };
+      for await (const ev of adapter.chat(req, ctrl.signal)) {
+        if (ev.type === 'token') raw += ev.text;
+        if (ev.type === 'error') return fallback;
+      }
+    } catch {
+      return fallback;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const parsed = extractJson(raw) as
+      | { mode?: unknown; targets?: unknown; brief?: unknown }
+      | null;
+    if (!parsed) return fallback;
+    const mode = parsed.mode === 'dispatch' ? 'dispatch' : 'plan';
+    const targets = Array.isArray(parsed.targets)
+      ? parsed.targets.filter((t): t is string => typeof t === 'string' && memberIds.includes(t))
+      : [];
+    const brief = typeof parsed.brief === 'string' && parsed.brief.trim() ? parsed.brief.trim() : input.text;
+    // dispatch with no valid target is useless → fall back to planning.
+    if (mode === 'dispatch' && targets.length === 0) return fallback;
+    return { mode, targets, brief };
+  }
+
+  /**
+   * One cheap, timeout-guarded summarization call used by context compaction.
+   * Returns '' on any failure so the caller keeps the old summary (fail-open).
+   */
+  async summarizeForCompaction(input: string): Promise<string> {
+    const adapter = this.pickAdapter();
+    if (!adapter) return '';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20_000);
+    let raw = '';
+    try {
+      for await (const ev of adapter.chat(
+        {
+          taskId: 'compact-' + Date.now(),
+          metadata: { purpose: 'compaction' },
+          systemPrompt:
+            '把下面的项目对话/进展压缩成一段中文摘要（≤ 200 字），只保留：当前目标、已确定的关键决策、已完成的部分、仍未解决的问题。' +
+            '不要逐条复述，不要加客套，直接输出摘要正文。',
+          messages: [{ role: 'user', content: input }],
+          budget: { maxTokens: 320 },
+        },
+        ctrl.signal,
+      )) {
+        if (ev.type === 'token') raw += ev.text;
+        if (ev.type === 'error') return '';
+      }
+    } catch {
+      return '';
+    } finally {
+      clearTimeout(timer);
+    }
+    return raw.trim();
   }
 
   async getPlannerProfile(conversationId: string): Promise<PlannerAgentProfile | null> {
@@ -196,7 +308,7 @@ export class PlannerService {
         Array.isArray(t.acceptance) && t.acceptance.length > 0
           ? t.acceptance
           : [{ kind: 'manual' }];
-      const assignee = pickAssignee(t.candidateAgents, this.registry, goal);
+      const assignee = pickAssignee(t.candidateAgents, this.registry, goal, availableIds);
       tasks.push({
         id,
         goal,
@@ -325,15 +437,58 @@ function extractJson(text: string): RawPlan | null {
   }
 }
 
-function pickAssignee(candidates: string[] | undefined, registry: AdapterRegistry, goal: string): string | undefined {
+/**
+ * Resolve a task's assignee. Priority:
+ *  1. An LLM-suggested candidate that is an actual conversation member.
+ *  2. The conversation's role agent that best matches the goal (so the chat
+ *     shows "前端工程师" doing it, not the raw "DeepSeek V4 Flash" model).
+ *  3. Any conversation member.
+ *  4. Only if there are NO members: a global registry model.
+ */
+function pickAssignee(
+  candidates: string[] | undefined,
+  registry: AdapterRegistry,
+  goal: string,
+  availableIds: Set<string>,
+): string | undefined {
+  const members = [...availableIds].filter((id) => id !== 'orchestrator' && id !== 'mock');
+
   if (Array.isArray(candidates)) {
     for (const c of candidates) {
-      if (typeof c === 'string' && c.trim() && c !== 'orchestrator') return c;
+      if (typeof c === 'string' && members.includes(c)) return c;
     }
   }
+
+  if (members.length > 0) {
+    const role = inferRoleSuffix(goal);
+    if (role) {
+      const hit = members.find((id) => id.endsWith(role));
+      if (hit) return hit;
+    }
+    // No clear role → coding goals go to an engineer member, else first member.
+    if (isCodingGoal(goal)) {
+      const eng = members.find((id) => /(frontend|backend)-engineer$/.test(id));
+      if (eng) return eng;
+    }
+    return members[0];
+  }
+
+  // Fallback only when the conversation has no configured members at all.
   if (isCodingGoal(goal)) return pickCodingAgent(registry);
-  // Default fallback in priority order.
   return pickDefault(registry);
+}
+
+/** Map a task goal to a role-agent id suffix used by conv-agent ids. */
+function inferRoleSuffix(goal: string): string | undefined {
+  const g = goal.toLowerCase();
+  if (/前端|界面|页面|组件|样式|ui|ux|preview|react|vue|css/.test(g)) return 'frontend-engineer';
+  if (/后端|接口|api|数据库|服务端|server|backend|持久化|鉴权/.test(g)) return 'backend-engineer';
+  if (/验证|测试|qa|编译|compile|build|运行错误|回归/.test(g)) return 'qa-tester';
+  if (/审查|review|代码质量|risk|风险|安全|边界/.test(g)) return 'code-reviewer';
+  if (/部署|环境|docker|脚本|依赖|ci|env/.test(g)) return 'env-engineer';
+  if (/架构|设计|拆解|技术选型|模块|数据流|architecture/.test(g)) return 'solution-architect';
+  if (/需求|目标|范围|验收|产品|prd|用户/.test(g)) return 'product-analyst';
+  return undefined;
 }
 
 function pickRole(ids: Set<string>, preferred: string[]): string | undefined {

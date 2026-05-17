@@ -5,12 +5,16 @@ import dynamic from 'next/dynamic';
 import type { EditorProps } from '@monaco-editor/react';
 import {
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ChevronUp,
+  PanelLeftClose,
+  PanelRightClose,
   Braces,
   File,
   FileCode2,
   FileText,
+  Coins,
   Folder,
   GitBranch,
   Image,
@@ -33,6 +37,7 @@ import { ChatPane } from './ChatPane';
 import { PlanCard } from './PlanCard';
 import { PreviewPanel } from './PreviewPanel';
 import { DeployPanel } from './DeployPanel';
+import { UsagePanel } from './UsagePanel';
 
 const MonacoEditor = dynamic<EditorProps>(
   () => import('@monaco-editor/react').then((mod) => mod.Editor),
@@ -118,10 +123,18 @@ export function IdeShell() {
   const activeId = useConversationStore((s) => s.activeId);
   const [projectWidth, setProjectWidth] = useState(300);
   const [chatWidth, setChatWidth] = useState(720);
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
   const [chatListWidth, setChatListWidth] = useState(260);
   const [terminalHeight, setTerminalHeight] = useState(190);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const clearSelectedPath = useCallback(() => setSelectedPath(null), []);
+
+  // Never let BOTH sides collapse into a blank screen — if collapsing one
+  // would hide everything, re-open the chat so there's always content.
+  useEffect(() => {
+    if (!leftOpen && !rightOpen) setRightOpen(true);
+  }, [leftOpen, rightOpen]);
 
   useEffect(() => {
     setSelectedPath(null);
@@ -163,37 +176,113 @@ export function IdeShell() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-bg text-text">
-      <section
-        className="flex min-w-0 shrink-0 flex-col border-r border-white/5 bg-bg-soft"
-        style={{ width: projectWidth }}
-      >
-        <ProjectPanel selectedPath={selectedPath} onSelectPath={setSelectedPath} />
-      </section>
+      {/* ---- Workspace side (file/Plan panel + code editor collapse together) ---- */}
+      {leftOpen ? (
+        <>
+          <section
+            className="flex min-w-0 shrink-0 flex-col border-r border-white/5 bg-bg-soft"
+            style={{ width: projectWidth }}
+          >
+            <ProjectPanel selectedPath={selectedPath} onSelectPath={setSelectedPath} />
+          </section>
+          <ResizeHandle onMouseDown={(e) => beginResize('project', e)} />
+          <main className="flex min-w-[420px] flex-1 flex-col overflow-hidden bg-bg">
+            <CodeWorkbench
+              selectedPath={selectedPath}
+              terminalHeight={terminalHeight}
+              onResizeTerminal={(e) => beginResize('terminal', e)}
+              onMissingPath={clearSelectedPath}
+            />
+          </main>
+        </>
+      ) : (
+        <ExpandRail side="left" label="工作区" onClick={() => setLeftOpen(true)} />
+      )}
 
-      <ResizeHandle onMouseDown={(e) => beginResize('project', e)} />
-
-      <main className="flex min-w-[420px] flex-1 flex-col overflow-hidden bg-bg">
-        <CodeWorkbench
-          selectedPath={selectedPath}
-          terminalHeight={terminalHeight}
-          onResizeTerminal={(e) => beginResize('terminal', e)}
-          onMissingPath={clearSelectedPath}
-        />
-      </main>
-
-      <ResizeHandle onMouseDown={(e) => beginResize('chat', e)} />
-
-      <section
-        className="flex min-w-0 shrink-0 border-l border-white/5 bg-bg-soft"
-        style={{ width: chatWidth }}
-      >
-        <div className="min-w-0 shrink-0" style={{ width: chatListWidth }}>
-          <Sidebar className="w-full" />
+      {/* ---- Center divider: both collapse handles live here, faint until
+              the mouse comes near the dividing line ---- */}
+      {leftOpen || rightOpen ? (
+        <div className="group/divider relative flex w-2 shrink-0 items-center justify-center">
+          <div
+            onMouseDown={
+              leftOpen && rightOpen ? (e) => beginResize('chat', e) : undefined
+            }
+            className={clsx(
+              'h-full w-full bg-white/[0.04] transition-colors group-hover/divider:bg-accent/40',
+              leftOpen && rightOpen ? 'cursor-col-resize' : '',
+            )}
+            aria-label="拖动调整左右占比"
+          />
+          {leftOpen ? (
+            <button
+              onClick={() => setLeftOpen(false)}
+              title="收起工作区（含代码区）"
+              className="absolute right-full top-1/2 -translate-y-1/2 rounded-l-md border border-r-0 border-white/10 bg-bg-panel/90 p-1 text-text-muted opacity-0 transition-opacity duration-150 hover:bg-white/10 hover:text-text group-hover/divider:opacity-100"
+            >
+              <PanelLeftClose className="h-4 w-4" />
+            </button>
+          ) : null}
+          {rightOpen ? (
+            <button
+              onClick={() => setRightOpen(false)}
+              title="收起群聊"
+              className="absolute left-full top-1/2 -translate-y-1/2 rounded-r-md border border-l-0 border-white/10 bg-bg-panel/90 p-1 text-text-muted opacity-0 transition-opacity duration-150 hover:bg-white/10 hover:text-text group-hover/divider:opacity-100"
+            >
+              <PanelRightClose className="h-4 w-4" />
+            </button>
+          ) : null}
         </div>
-        <ResizeHandle onMouseDown={(e) => beginResize('chatList', e)} />
-        <ChatPane />
-      </section>
+      ) : null}
+
+      {/* ---- Chat side ---- */}
+      {rightOpen ? (
+        <section
+          className={clsx(
+            'flex min-w-0 border-l border-white/5 bg-bg-soft',
+            // Fixed (resizable) width only when the workspace is also shown;
+            // if the workspace is collapsed, the chat fills the whole screen.
+            leftOpen ? 'shrink-0' : 'flex-1',
+          )}
+          style={leftOpen ? { width: chatWidth } : undefined}
+        >
+          <div className="min-w-0 shrink-0" style={{ width: chatListWidth }}>
+            <Sidebar className="w-full" />
+          </div>
+          <ResizeHandle onMouseDown={(e) => beginResize('chatList', e)} />
+          <ChatPane />
+        </section>
+      ) : (
+        <ExpandRail side="right" label="群聊" onClick={() => setRightOpen(true)} />
+      )}
     </div>
+  );
+}
+
+function ExpandRail({
+  side,
+  label,
+  onClick,
+}: {
+  side: 'left' | 'right';
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={`展开${label}`}
+      className={clsx(
+        'flex w-9 shrink-0 flex-col items-center gap-2 bg-bg-soft py-3 text-text-muted hover:text-text',
+        side === 'left' ? 'border-r border-white/5' : 'border-l border-white/5',
+      )}
+    >
+      {side === 'left' ? (
+        <ChevronRight className="h-4 w-4" />
+      ) : (
+        <ChevronLeft className="h-4 w-4" />
+      )}
+      <span className="[writing-mode:vertical-rl] text-[10px] tracking-widest">{label}</span>
+    </button>
   );
 }
 
@@ -237,7 +326,7 @@ function ProjectPanel({
         </div>
       </div>
 
-      <nav className="grid grid-cols-4 gap-1 border-b border-white/5 bg-bg-panel/30 p-1.5">
+      <nav className="flex gap-1 overflow-x-auto border-b border-white/5 bg-bg-panel/30 p-1.5 [scrollbar-width:thin]">
         <ProjectTab icon={<Folder className="h-3.5 w-3.5" />} active={tab === 'workspace'} onClick={() => setTab('workspace')}>
           Files
         </ProjectTab>
@@ -255,6 +344,9 @@ function ProjectPanel({
         <ProjectTab icon={<Rocket className="h-3.5 w-3.5" />} active={tab === 'deploy'} onClick={() => setTab('deploy')}>
           Deploy
         </ProjectTab>
+        <ProjectTab icon={<Coins className="h-3.5 w-3.5" />} active={tab === 'usage'} onClick={() => setTab('usage')}>
+          Cost
+        </ProjectTab>
       </nav>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -270,6 +362,7 @@ function ProjectPanel({
         ) : null}
         {tab === 'preview' ? <PreviewPanel /> : null}
         {tab === 'deploy' ? <DeployPanel /> : null}
+        {tab === 'usage' ? <UsagePanel /> : null}
       </div>
     </aside>
   );
@@ -496,6 +589,16 @@ function CodeWorkbench({
     if (!activeId || !selectedPath) {
       setFile(null);
       setDraft('');
+      return;
+    }
+    // Binary (image / pdf / archive / font …): never fetch as text — that's
+    // what produced the garbled mojibake. Image preview / placeholder is
+    // handled in the render branch below.
+    if (isBinaryName(selectedPath)) {
+      setFile(null);
+      setDraft('');
+      setError(null);
+      setLoading(false);
       return;
     }
     setLoading(true);
@@ -774,7 +877,28 @@ function CodeWorkbench({
       </header>
 
       <div className="min-h-0 flex-1 bg-bg">
-        {file ? (
+        {selectedPath && isImageName(selectedPath) ? (
+          <div className="flex h-full min-h-0 items-center justify-center overflow-auto bg-bg p-6">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={
+                activeId
+                  ? apiUrl(
+                      `/api/conversations/${encodeURIComponent(activeId)}/workspace/raw?path=${encodeURIComponent(
+                        selectedPath,
+                      )}&mimeType=${encodeURIComponent(mimeForName(selectedPath))}`,
+                    )
+                  : ''
+              }
+              alt={selectedPath.split('/').pop() ?? 'image'}
+              className="max-h-full max-w-full rounded border border-white/10 object-contain"
+            />
+          </div>
+        ) : selectedPath && isBinaryName(selectedPath) ? (
+          <div className="flex h-full items-center justify-center p-8 text-center text-sm text-text-muted">
+            二进制文件（{extensionOf(selectedPath).toUpperCase()}），不支持文本预览。
+          </div>
+        ) : file ? (
           <div className="h-full min-h-0 bg-bg">
             <MonacoEditor
               key={file.path}
@@ -878,6 +1002,9 @@ function TerminalPane({
   onCollapse: () => void;
 }) {
   const active = sessions.find((session) => session.id === activeId) ?? sessions[0];
+  const agentRuns = useConversationStore((s) =>
+    s.activeId ? s.agentTerminalByConv[s.activeId] : undefined,
+  );
   const outputRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -965,6 +1092,36 @@ function TerminalPane({
           {active.running ? (
             <div className="mt-1 text-accent">Running...</div>
           ) : null}
+
+          {agentRuns && agentRuns.length > 0 ? (
+            <div className="mt-3 border-t border-white/5 pt-3">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-text-muted/70">
+                🤖 Agent 执行的命令（只读）
+              </div>
+              {agentRuns.map((r) => (
+                <div key={r.id} className="mb-2">
+                  <div className="flex items-baseline gap-2">
+                    <span className="shrink-0 text-amber-400/80">
+                      {r.agentName} ❯
+                    </span>
+                    <span className="min-w-0 break-all text-text">{r.command}</span>
+                  </div>
+                  {r.stdout ? (
+                    <pre className="whitespace-pre-wrap text-text-muted">{r.stdout}</pre>
+                  ) : null}
+                  {r.stderr ? (
+                    <pre className="whitespace-pre-wrap text-rose-300/90">{r.stderr}</pre>
+                  ) : null}
+                  <div className="text-[10px] text-text-muted/60">
+                    {r.timedOut
+                      ? '⏱️ timed out'
+                      : `exit ${r.exitCode ?? '?'}`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
           <div className="mt-1 flex items-baseline gap-2">
             <span className="shrink-0 text-accent">{formatTerminalPrompt(active.cwd)}</span>
             <input
@@ -1072,7 +1229,7 @@ function ProjectTab({
     <button
       onClick={onClick}
       className={clsx(
-        'flex items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs',
+        'flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded px-2.5 py-1.5 text-xs',
         active ? 'bg-white/10 text-text' : 'text-text-muted hover:bg-white/5 hover:text-text',
       )}
     >
@@ -1225,6 +1382,29 @@ function extensionOf(name: string): string {
   if (lower.endsWith('.lock')) return 'lock';
   const idx = lower.lastIndexOf('.');
   return idx >= 0 ? lower.slice(idx + 1) : '';
+}
+
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'svg']);
+const BINARY_EXT = new Set([
+  ...IMAGE_EXT,
+  'pdf', 'zip', 'gz', 'tar', 'rar', '7z', 'exe', 'dll', 'bin', 'wasm',
+  'mp3', 'wav', 'ogg', 'mp4', 'webm', 'mov', 'avi',
+  'woff', 'woff2', 'ttf', 'otf', 'eot', 'psd', 'sketch', 'class', 'jar',
+]);
+
+function isImageName(name: string): boolean {
+  return IMAGE_EXT.has(extensionOf(name));
+}
+function isBinaryName(name: string): boolean {
+  return BINARY_EXT.has(extensionOf(name));
+}
+function mimeForName(name: string): string {
+  const e = extensionOf(name);
+  if (e === 'svg') return 'image/svg+xml';
+  if (e === 'jpg' || e === 'jpeg') return 'image/jpeg';
+  if (IMAGE_EXT.has(e)) return `image/${e}`;
+  if (e === 'pdf') return 'application/pdf';
+  return 'application/octet-stream';
 }
 
 function isConfigFile(name: string): boolean {

@@ -17,6 +17,14 @@ export interface AgentToolRunInput {
   send: (event: ServerEvent) => void;
   signal?: AbortSignal;
   maxToolRounds?: number;
+  /**
+   * When true, this run does NOT emit the terminal `msg_done`. The caller
+   * (executor) drives several runs for one message across verification
+   * rounds and emits a single final `msg_done` itself — so the message
+   * stays in the streaming state and the live activity feed keeps showing
+   * instead of collapsing to a "done"-looking thinking block mid-task.
+   */
+  suppressDone?: boolean;
 }
 
 export interface AgentToolRunResult {
@@ -124,7 +132,7 @@ export class AgentToolRunnerService {
               retryable: true,
             },
           });
-          input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+          if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
           return { output, errored: true };
         }
         input.send({
@@ -136,7 +144,7 @@ export class AgentToolRunnerService {
             retryable: true,
           },
         });
-        input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+        if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
         return { output, errored: true };
       } finally {
         if (idleTimer) clearTimeout(idleTimer);
@@ -145,7 +153,7 @@ export class AgentToolRunnerService {
       if (roundErrored) return { output, errored: true };
 
       if (toolCalls.length === 0) {
-        input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+        if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
         return { output, errored: false };
       }
 
@@ -175,6 +183,39 @@ export class AgentToolRunnerService {
           msgId: input.msgId,
           delta: `\n${describeToolDone(call.name, call.args, result)}\n`,
         });
+        // Mirror agent terminal commands into the user's Terminal panel
+        // (read-only) so they can watch what the agent runs in real time.
+        if (call.name === 'terminal_run') {
+          const inner = (result as { ok?: boolean; result?: unknown }).result as
+            | {
+                command?: string;
+                cwd?: string;
+                stdout?: string;
+                stderr?: string;
+                exitCode?: number | null;
+                timedOut?: boolean;
+              }
+            | undefined;
+          input.send({
+            op: 'agent_terminal',
+            conversationId: input.conversationId,
+            agentName:
+              (input.request.metadata?.agentName as string | undefined) ?? 'agent',
+            command:
+              inner?.command ??
+              ((call.args as { command?: string })?.command ?? ''),
+            cwd: inner?.cwd ?? '',
+            stdout: inner?.stdout ?? '',
+            stderr:
+              inner?.stderr ??
+              ((result as { ok?: boolean; error?: string }).ok === false
+                ? String((result as { error?: string }).error ?? '')
+                : ''),
+            exitCode: inner?.exitCode ?? null,
+            timedOut: inner?.timedOut ?? false,
+            createdAt: new Date().toISOString(),
+          });
+        }
         messages.push({
           role: 'tool',
           content: JSON.stringify(result),

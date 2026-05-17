@@ -18,6 +18,13 @@ export interface MentionPickerProps {
   onCancel: () => void;
 }
 
+/** `conv-agent-<uuid>-frontend-engineer` → `frontend-engineer`; plain ids unchanged. */
+function shortMention(id: string): string {
+  if (!id.startsWith('conv-agent-')) return id;
+  const m = /^conv-agent-[0-9a-fA-F-]{36}-(.+)$/.exec(id);
+  return m?.[1] ?? id;
+}
+
 export function MentionPicker({ candidates, query, onSelect, onCancel }: MentionPickerProps) {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -116,7 +123,7 @@ export function MentionPicker({ candidates, query, onSelect, onCancel }: Mention
               <span className="block truncate text-[11px] text-text-muted">{c.hint}</span>
             ) : null}
           </span>
-          <span className="font-mono text-[10px] text-text-muted">@{c.id}</span>
+          <span className="shrink-0 font-mono text-[10px] text-text-muted">@{shortMention(c.id)}</span>
         </button>
       ))}
     </div>

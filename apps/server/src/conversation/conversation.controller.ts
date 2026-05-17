@@ -18,6 +18,7 @@ import { AgentsRepo, type AgentDescriptor } from '../db/agents.repo.js';
 import { PlanService } from '../orchestrator/plan.service.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import { WorkspaceService } from '../workspace/workspace.service.js';
+import { UsageRepo, type ConversationUsageSummary } from '../db/usage.repo.js';
 
 export interface ConversationStateResponse {
   conversationId: string;
@@ -97,6 +98,7 @@ export class ConversationController {
     private readonly agents: AgentsRepo,
     private readonly adapterFactory: AdapterFactoryService,
     private readonly workspace: WorkspaceService,
+    private readonly usage: UsageRepo,
   ) {}
 
   // ----- conversations ----------------------------------------------------
@@ -182,6 +184,12 @@ export class ConversationController {
       messages: msgs,
       plan: plan ?? null,
     };
+  }
+
+  @Get('conversations/:id/usage')
+  async getUsage(@Param('id') id: string): Promise<ConversationUsageSummary> {
+    const realId = this.messages.resolveConversationUuid(id) ?? id;
+    return this.usage.summaryForConversation(realId);
   }
 
   // ----- members ----------------------------------------------------------

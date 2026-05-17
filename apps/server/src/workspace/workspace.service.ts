@@ -347,6 +347,7 @@ export class WorkspaceService {
 
       const timer = setTimeout(() => {
         timedOut = true;
+        killTree(child.pid);
         child.kill();
       }, timeoutMs);
 
@@ -668,6 +669,34 @@ const WORKSPACE_TOOL_SCHEMAS: ToolSchema[] = [
     },
   },
 ];
+
+/**
+ * Kill the WHOLE process tree of a spawned terminal command. Agents like to
+ * start dev/servers ("node server.js", "npm run start") which keep running
+ * after our top-level `child.kill()` — on Windows the npm→node grandchildren
+ * survive, pile up, hold ports/handles and eventually starve the server (the
+ * workspace file-list endpoint then "Failed to fetch"). taskkill /T reaps the
+ * entire tree. Best-effort, never throws.
+ */
+function killTree(pid: number | undefined): void {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+    } else {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        process.kill(pid, 'SIGKILL');
+      }
+    }
+  } catch {
+    /* process already gone — fine */
+  }
+}
 
 function sanitizeConversationId(id: string): string {
   const safe = id.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120);

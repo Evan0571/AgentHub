@@ -15,6 +15,8 @@ import { createHash } from 'node:crypto';
 import { ADAPTER_REGISTRY } from './constants.js';
 import { TracingService } from '../observability/tracing.service.js';
 import { withLangfuse } from '../observability/adapter-tracing.js';
+import { withUsage } from '../observability/usage-middleware.js';
+import { UsageRepo } from '../db/usage.repo.js';
 
 /**
  * Resolves an `AgentAdapter` instance for a given agent row, honoring its
@@ -45,6 +47,7 @@ export class AdapterFactoryService {
   constructor(
     @Inject(ADAPTER_REGISTRY) private readonly registry: AdapterRegistry,
     private readonly tracing: TracingService,
+    private readonly usage: UsageRepo,
   ) {}
 
   resolveForAgent(spec: ResolvedAgentSpec): AgentAdapter {
@@ -158,7 +161,12 @@ export class AdapterFactoryService {
 
   private wrap(raw: AgentAdapter, _agentId: string): AgentAdapter {
     // Same middleware order as the pre-registered adapters in adapter.module.ts.
-    const wrap = compose(withLogging, withLangfuse(this.tracing), withRetry({ max: 2 }));
+    const wrap = compose(
+      withLogging,
+      withLangfuse(this.tracing),
+      withUsage(this.usage, this.tracing),
+      withRetry({ max: 2 }),
+    );
     return wrap(raw);
   }
 

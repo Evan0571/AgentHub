@@ -40,6 +40,18 @@ export type ServerEvent =
       createdAt: ISODateTime;
     }
   | { op: 'replay_frame'; frame: ReplayFrame }
+  | {
+      op: 'agent_terminal';
+      conversationId: ID;
+      agentName: string;
+      command: string;
+      cwd: string;
+      stdout: string;
+      stderr: string;
+      exitCode: number | null;
+      timedOut: boolean;
+      createdAt: ISODateTime;
+    }
   | { op: 'error'; code: string; message: string; retryable: boolean };
 
 export interface TokenUsage {

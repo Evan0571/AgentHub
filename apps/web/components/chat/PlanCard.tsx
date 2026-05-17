@@ -19,7 +19,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import type { Plan, PlanEdit, PlanTask, TaskStatus } from '@agenthub/shared-types';
-import { isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
+import { isHiddenSystemAgentId, prettyAgentName, roleColorFor, useConversationStore } from '@/lib/store';
 
 const AGENTS = ['deepseek-v4-flash', 'deepseek-v4-pro', 'codex', 'claude-code', 'doubao', 'mock'] as const;
 
@@ -178,8 +178,14 @@ function TaskRow({
   onDelete: () => void;
 }) {
   const profile = task.assigneeAgentId ? agents.find((a) => a.id === task.assigneeAgentId) : undefined;
-  const agentName = profile?.name ?? (task.assigneeAgentId ? AGENT_NAME[task.assigneeAgentId] ?? task.assigneeAgentId : '?');
-  const agentColor = profile?.avatarColor ?? (task.assigneeAgentId ? AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280' : '#6b7280');
+  const agentName = task.assigneeAgentId
+    ? prettyAgentName(task.assigneeAgentId, profile?.name ?? AGENT_NAME[task.assigneeAgentId])
+    : '?';
+  const agentColor =
+    profile?.avatarColor ??
+    (task.assigneeAgentId
+      ? roleColorFor(task.assigneeAgentId, AGENT_COLOR[task.assigneeAgentId] ?? '#6b7280')
+      : '#6b7280');
 
   return (
     <div

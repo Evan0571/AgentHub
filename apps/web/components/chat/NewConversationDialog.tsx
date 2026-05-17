@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { Check, Loader2, MessageSquare, Sparkles, Users, X } from 'lucide-react';
 import clsx from 'clsx';
 import { isConversationScopedAgentId, isHiddenSystemAgentId, useConversationStore } from '@/lib/store';
@@ -63,7 +63,14 @@ const SKILL_LIBRARY = [
   {
     id: 'ui-polish',
     label: '界面打磨',
-    prompt: '检查信息层级、空状态、按钮对比度、响应式布局和交互反馈，避免通用 AI 风格。',
+    prompt:
+      '按成熟产品标准做设计，不是 demo：①建立设计系统——4/8 倍数间距、统一圆角与阴影层级、语义色板（主色/中性灰阶/成功/警告/危险）；②排版有层次——标题/正文/辅助文字字号字重拉开、行高约 1.5；③真实状态——空状态有引导、加载有 skeleton、错误有可读提示、hover/active/focus 都有反馈；④布局用卡片/分区/留白组织，关键操作显眼，移动端不破版；⑤过渡 150-250ms、对比度与键盘可达；⑥严禁 AI 味——不要满屏蓝紫渐变、不要默认 MD3 大圆角、不要 emoji 堆砌。',
+  },
+  {
+    id: 'design-system',
+    label: '设计体系',
+    prompt:
+      '产出前先定一份轻量设计规范（色板/字阶/间距/组件态），并贯穿所有页面保持一致；参考成熟 SaaS（Linear/Notion/Vercel 风格）的克制与精致，而不是模板感。',
   },
   {
     id: 'api-contract',
@@ -86,11 +93,20 @@ type SkillId = (typeof SKILL_LIBRARY)[number]['id'];
 
 const ROLE_SLOTS = [
   {
+    id: 'team-lead',
+    badge: 'TL',
+    name: '组长',
+    summary: '调度大脑：判断派活 / 拆 Plan',
+    defaultModel: 'codex' as ModelId,
+    defaultSkills: [] as SkillId[],
+  },
+  {
     id: 'product-analyst',
     badge: 'PM',
     name: '产品分析师',
     summary: '目标、用户、范围、验收',
-    defaultModel: 'deepseek-v4-flash' as ModelId,
+    // Codex (vision) — needs to read uploaded reference screenshots.
+    defaultModel: 'codex' as ModelId,
     defaultSkills: ['requirements', 'user-acceptance'] as SkillId[],
   },
   {
@@ -98,7 +114,9 @@ const ROLE_SLOTS = [
     badge: 'AR',
     name: '架构师',
     summary: '架构、模块、任务 DAG',
-    defaultModel: 'deepseek-v4-pro' as ModelId,
+    // Codex (gpt-4o) is vision-capable — the architect must be able to read
+    // screenshots the user uploads when describing the project.
+    defaultModel: 'codex' as ModelId,
     defaultSkills: ['task-dag', 'api-contract', 'risk-scan'] as SkillId[],
   },
   {
@@ -106,15 +124,15 @@ const ROLE_SLOTS = [
     badge: 'FE',
     name: '前端工程师',
     summary: '页面、交互、预览产物',
-    defaultModel: 'codex' as ModelId,
-    defaultSkills: ['workspace-first', 'ui-polish', 'terminal-verify'] as SkillId[],
+    defaultModel: 'deepseek-v4-flash' as ModelId,
+    defaultSkills: ['workspace-first', 'ui-polish', 'design-system', 'terminal-verify'] as SkillId[],
   },
   {
     id: 'backend-engineer',
     badge: 'BE',
     name: '后端工程师',
     summary: 'API、数据、服务逻辑',
-    defaultModel: 'codex' as ModelId,
+    defaultModel: 'deepseek-v4-flash' as ModelId,
     defaultSkills: ['workspace-first', 'api-contract', 'terminal-verify'] as SkillId[],
   },
   {
@@ -122,7 +140,7 @@ const ROLE_SLOTS = [
     badge: 'CR',
     name: 'Code Reviewer',
     summary: '代码审查、回归风险',
-    defaultModel: 'codex' as ModelId,
+    defaultModel: 'deepseek-v4-pro' as ModelId,
     defaultSkills: ['risk-scan', 'terminal-verify'] as SkillId[],
   },
   {
@@ -130,7 +148,7 @@ const ROLE_SLOTS = [
     badge: 'EV',
     name: '环境配置员',
     summary: '依赖、脚本、部署前检查',
-    defaultModel: 'codex' as ModelId,
+    defaultModel: 'deepseek-v4-flash' as ModelId,
     defaultSkills: ['workspace-first', 'terminal-verify'] as SkillId[],
   },
   {
@@ -138,7 +156,7 @@ const ROLE_SLOTS = [
     badge: 'QA',
     name: '测试员',
     summary: '测试计划、真实错误复现',
-    defaultModel: 'codex' as ModelId,
+    defaultModel: 'deepseek-v4-flash' as ModelId,
     defaultSkills: ['terminal-verify', 'user-acceptance'] as SkillId[],
   },
   {
@@ -192,6 +210,9 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const [activeRoleId, setActiveRoleId] = useState<RoleId>('solution-architect');
   const [groupRules, setGroupRules] = useState(DEFAULT_GROUP_RULES);
   const [busy, setBusy] = useState(false);
+  // Synchronous guard: React's setBusy is async, so a fast double-click /
+  // Enter+click could both pass the !busy check and create the group twice.
+  const submittingRef = useRef(false);
   const [err, setErr] = useState<string | null>(null);
 
   const availableRoleIds = useMemo(
@@ -250,7 +271,8 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   };
 
   const onSubmit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || submittingRef.current) return;
+    submittingRef.current = true;
     setBusy(true);
     setErr(null);
     try {
@@ -282,6 +304,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
       setErr(prettifyApiError(e instanceof Error ? e : String(e), '创建失败'));
     } finally {
       setBusy(false);
+      submittingRef.current = false;
     }
   };
 

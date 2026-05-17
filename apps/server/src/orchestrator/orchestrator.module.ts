@@ -9,7 +9,8 @@ import { WorkspaceModule } from '../workspace/workspace.module.js';
 @Module({
   imports: [WorkspaceModule],
   providers: [OrchestratorService, PlannerService, ExecutorService, CriticService, PlanService],
-  // PlanService is consumed by ConversationController for /api/conversations/:id/state hydration.
-  exports: [OrchestratorService, PlanService],
+  // PlanService → ConversationController hydration; PlannerService →
+  // MentionRouter intent triage.
+  exports: [OrchestratorService, PlanService, PlannerService],
 })
 export class OrchestratorModule {}

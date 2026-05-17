@@ -4,12 +4,14 @@ import { type ClientEvent, type MessageAttachment, type MessageContent, type Ser
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import type { OrchestratorService } from '../orchestrator/orchestrator.service.js';
+import { PlannerService } from '../orchestrator/planner.service.js';
 import { MessagesRepo } from '../db/messages.repo.js';
 import { AgentsRepo } from '../db/agents.repo.js';
 import { ConversationsRepo } from '../db/conversations.repo.js';
 import { TracingService } from '../observability/tracing.service.js';
 import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
 import { WorkspaceService } from '../workspace/workspace.service.js';
+import { ProjectStateService } from '../workspace/project-state.service.js';
 
 interface ResolvedAgent {
   agentId: string;          // the canonical agent id (UUID or built-in slug)
@@ -45,7 +47,13 @@ const DEFAULT_SYSTEM_PROMPT = `你是 AgentHub 群聊中的助手。请遵守如
 
 3. 使用 Markdown：列表用 \`-\`，强调用 \`**bold**\`，命令用行内 \`code\`。
 4. 中文回复（除非用户用英文提问）。简洁、有结论先行。
-5. 多文件 React 项目：**入口文件优先命名为 \`App.tsx\` 或 \`main.tsx\`**；子组件用 PascalCase basename（如 \`TodoItem.tsx\`），路径用 \`src/components/\` 前缀；ESM \`import\` 语法允许，第三方库默认走 esm.sh（react / react-dom / lucide-react / clsx / zustand）。`;
+5. 多文件 React 项目：**入口文件优先命名为 \`App.tsx\` 或 \`main.tsx\`**；子组件用 PascalCase basename（如 \`TodoItem.tsx\`），路径用 \`src/components/\` 前缀；ESM \`import\` 语法允许，第三方库默认走 esm.sh（react / react-dom / lucide-react / clsx / zustand）。
+
+## 团队协作准则（所有角色都要遵守）
+- **不要急，允许多轮迭代**：完整项目不可能一次做完。先打通最小闭环，再分轮迭代增强；可以做"预处理/打地基"的过渡产出，不要假装一步到位。
+- **互相沟通**：你的改动如果会影响别人的产物（改了接口契约、文件结构、数据模型、共享类型等），必须在回复里 @ 受影响的角色，让他们对齐，并简述改了什么、为什么。
+- **遇到不确定就问用户**：需求模糊、范围不清、有多种合理做法且代价大时，**直接 @ 用户问清楚再动手**，不要自行假设拍板。
+- **禁止占用 3000 / 4000 端口**（用户本机的开发服务正在用）。需要本地起服务一律换 5173 / 8080 等其它端口；优先用 \`npm run build\` / \`tsc\` 这类会退出的命令验证，不要长跑 dev server（\`npm run start\` / \`vite\` 常驻进程）。`;
 
 @Injectable()
 export class MentionRouter {
@@ -58,6 +66,8 @@ export class MentionRouter {
     private readonly adapterFactory: AdapterFactoryService,
     private readonly toolRunner: AgentToolRunnerService,
     private readonly workspace: WorkspaceService,
+    private readonly planner: PlannerService,
+    private readonly projectState: ProjectStateService,
   ) {}
 
   async route(
@@ -67,15 +77,72 @@ export class MentionRouter {
   ): Promise<void> {
     if (event.mentions.length === 0) return;
 
-    // Project planning is an internal route. The visible planner speaker is
-    // resolved by OrchestratorService from the conversation's architect member.
-    if (event.mentions.includes(PROJECT_PLANNER_MENTION) || event.mentions.includes('orchestrator')) {
-      // rootGoal must stay human-readable: it shows in the Plan panel and is
-      // echoed back in chat. The verbose attachment block (hashes, full
-      // workspace paths, text excerpts) is for the *executing* agents, not
-      // the displayed goal — keep just the user's words + a short note.
+    // The 组长 path: no explicit @ (PROJECT_PLANNER_MENTION), legacy
+    // 'orchestrator', OR the user explicitly @-ed the team-lead. In all three
+    // cases run triage (dispatch vs real Plan) — NOT plain chat, otherwise
+    // the 组长 just writes prose about who-does-what and nobody is actually
+    // assigned, which is exactly the bug the user hit.
+    const mentionsLead = event.mentions.some(
+      (m) => m === 'team-lead' || m.endsWith('-team-lead'),
+    );
+    if (
+      event.mentions.includes(PROJECT_PLANNER_MENTION) ||
+      event.mentions.includes('orchestrator') ||
+      mentionsLead
+    ) {
       const goal = contentToPlannerGoal(event.content);
-      await orchestrator.plan({ conversationId: event.conversationId, rootGoal: goal }, send);
+      const rawText = event.content.kind === 'text' ? event.content.text : goal;
+      const recentContext = await this.buildRecentContext(event.conversationId, 10);
+
+      // Once per project turn, fold older transcript into the rolling summary
+      // (Cursor/Codex-style compaction). Fire-and-forget + fail-open so it
+      // never adds latency or blocks the response.
+      void this.buildRecentContext(event.conversationId, 40)
+        .then((transcript) =>
+          this.projectState.compact(event.conversationId, transcript, (input) =>
+            this.planner.summarizeForCompaction(input),
+          ),
+        )
+        .catch(() => undefined);
+
+      // The whole 组长 path is guarded: triage / plan can throw or time out,
+      // but a group message must NEVER get a silent non-reply — always leave
+      // at least one visible 组长 message in the chat.
+      try {
+        const triage = await this.planner.triage({
+          conversationId: event.conversationId,
+          text: rawText,
+          recentContext,
+        });
+
+        if (triage.mode === 'dispatch' && triage.targets.length > 0) {
+          await this.tracing.runWithTrace(
+            {
+              name: 'lead_dispatch',
+              sessionId: event.conversationId,
+              metadata: { conversationId: event.conversationId, targets: triage.targets },
+            },
+            () => this.dispatchDirectly(event, triage.targets, triage.brief, send),
+          );
+          return;
+        }
+
+        // plan mode: 组长 narrates the hand-off, then the architect produces a
+        // real Plan DAG (orchestrator.plan resolves the architect as planner).
+        await this.emitCoordinatorNote(
+          event.conversationId,
+          `🧭 这是一个完整项目/较大改动，我（组长）交给**架构师**出 Plan，然后团队按 Plan 执行。`,
+          send,
+        );
+        await orchestrator.plan({ conversationId: event.conversationId, rootGoal: goal }, send);
+      } catch (e) {
+        console.error('[mention-router] 组长 path failed:', e);
+        await this.emitCoordinatorNote(
+          event.conversationId,
+          `⚠️ 我（组长）处理这条时出错了：${(e as Error).message || '未知错误'}。\n请重发一次，或把需求说得更具体一点；如果持续出错，看 server 控制台日志。`,
+          send,
+        ).catch(() => undefined);
+      }
       return;
     }
 
@@ -109,6 +176,7 @@ export class MentionRouter {
     const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
     const groupRules = conv?.groupSystemPrompt ?? null;
     const userContent = await this.contentToAdapterContent(event.conversationId, event.content);
+    const recentContext = await this.buildRecentContext(event.conversationId, 10);
 
     await Promise.all(
       peers.map((self) =>
@@ -118,11 +186,141 @@ export class MentionRouter {
           groupRules,
           conversationId: event.conversationId,
           userContent,
+          recentContext,
           hop: 0,
           send,
         }),
       ),
     );
+  }
+
+  /**
+   * Small-change path: the architect hands the message straight to specific
+   * engineers instead of building a Plan DAG. Posts a short "我交给 X" note
+   * (as the architect) then invokes the chosen members directly.
+   */
+  private async dispatchDirectly(
+    event: Extract<ClientEvent, { op: 'user_msg' }>,
+    targetIds: string[],
+    brief: string,
+    send: (e: ServerEvent) => void,
+  ): Promise<void> {
+    const resolved = (
+      await Promise.all(targetIds.map((id) => this.resolveAgent(id)))
+    ).filter((r): r is ResolvedAgent => r !== null);
+    if (resolved.length === 0) return;
+
+    const realConvId = this.messages.resolveConversationUuid(event.conversationId);
+    const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
+    const groupRules = conv?.groupSystemPrompt ?? null;
+
+    // 组长 hand-off note (so the chat shows the routing decision).
+    const leadId = (await this.resolveCoordinatorSpeaker(event.conversationId)) ?? 'system';
+    const noteId = cryptoRandomId();
+    const names = resolved.map((r) => r.name).join('、');
+    send({
+      op: 'msg_started',
+      message: {
+        id: noteId,
+        conversationId: event.conversationId,
+        senderType: leadId === 'system' ? 'system' : 'agent',
+        senderId: leadId,
+        createdAt: new Date().toISOString(),
+      },
+    });
+    const note = `🧭 这条不用拆 Plan，我（组长）直接派给 **${names}** 处理：\n\n> ${brief}`;
+    send({ op: 'msg_token', msgId: noteId, delta: note });
+    send({ op: 'msg_done', msgId: noteId });
+    void this.messages
+      .insert({
+        conversationSlug: event.conversationId,
+        senderType: leadId === 'system' ? 'system' : 'agent',
+        senderId: leadId,
+        text: note,
+      })
+      .catch(() => undefined);
+
+    // Build user content from the original message (keeps attachments/images)
+    // but prepend the 组长's brief so the engineer has a clear directive.
+    const baseContent = await this.contentToAdapterContent(event.conversationId, event.content);
+    const userContent =
+      typeof baseContent === 'string'
+        ? `架构师派单：${brief}\n\n用户原话：${baseContent}`
+        : [{ type: 'text' as const, text: `架构师派单：${brief}` }, ...baseContent];
+    const recentContext = await this.buildRecentContext(event.conversationId, 10);
+
+    await Promise.all(
+      resolved.map((self) =>
+        this.invokeAgent({
+          self,
+          peers: resolved,
+          groupRules,
+          conversationId: event.conversationId,
+          userContent,
+          recentContext,
+          hop: 0,
+          send,
+        }),
+      ),
+    );
+  }
+
+  /** Resolve the conversation's architect agentId for the hand-off speaker. */
+  /** Post a short message spoken by the 组长 (or system fallback). */
+  private async emitCoordinatorNote(
+    conversationId: string,
+    text: string,
+    send: (e: ServerEvent) => void,
+  ): Promise<void> {
+    const leadId = (await this.resolveCoordinatorSpeaker(conversationId)) ?? 'system';
+    const id = cryptoRandomId();
+    send({
+      op: 'msg_started',
+      message: {
+        id,
+        conversationId,
+        senderType: leadId === 'system' ? 'system' : 'agent',
+        senderId: leadId,
+        createdAt: new Date().toISOString(),
+      },
+    });
+    send({ op: 'msg_token', msgId: id, delta: text });
+    send({ op: 'msg_done', msgId: id });
+    void this.messages
+      .insert({
+        conversationSlug: conversationId,
+        senderType: leadId === 'system' ? 'system' : 'agent',
+        senderId: leadId,
+        text,
+      })
+      .catch(() => undefined);
+  }
+
+  /** The 组长 (coordinator) is the visible speaker for triage/dispatch. */
+  private async resolveCoordinatorSpeaker(conversationId: string): Promise<string | null> {
+    const realId = this.messages.resolveConversationUuid(conversationId);
+    const conv = realId ? await this.convsRepo.getById(realId) : null;
+    const members = conv?.members.filter((m) => m.agentId !== 'orchestrator' && m.agentId !== 'mock') ?? [];
+    const lead =
+      members.find((m) => m.agentId.endsWith('team-lead')) ??
+      members.find((m) => /组长|lead|协调|调度/i.test(`${m.name} ${m.systemPrompt ?? ''}`)) ??
+      members.find((m) => m.agentId.endsWith('solution-architect')) ??
+      members.find((m) => /架构|architect/i.test(`${m.name} ${m.systemPrompt ?? ''}`));
+    return lead?.agentId ?? null;
+  }
+
+  /** Compact transcript of the last `limit` messages — working memory (#3a). */
+  async buildRecentContext(conversationId: string, limit: number): Promise<string> {
+    const all = await this.messages.list(conversationId).catch(() => []);
+    if (all.length === 0) return '';
+    const recent = all.slice(-limit);
+    const lines = recent.map((m) => {
+      const who =
+        m.senderType === 'user' ? '用户' : m.senderType === 'system' ? '系统' : m.senderId;
+      const text = m.text.replace(/```[\s\S]*?```/g, ' [代码块] ').replace(/\s+/g, ' ').trim();
+      return `[${who}] ${text.length > 240 ? text.slice(0, 240) + '…' : text}`;
+    });
+    return lines.join('\n');
   }
 
   /** Look up an agent row → fall back to adapter-id-as-agent for legacy callers. */
@@ -168,13 +366,24 @@ export class MentionRouter {
    *   3. The agent's own role / system prompt
    *   4. Peer-awareness block ("you are X, peers are Y; only do your share")
    */
-  private buildSystemPrompt(self: ResolvedAgent, peers: ResolvedAgent[], groupRules: string | null): string {
+  private buildSystemPrompt(
+    self: ResolvedAgent,
+    peers: ResolvedAgent[],
+    groupRules: string | null,
+    recentContext?: string,
+  ): string {
     const blocks: string[] = [DEFAULT_SYSTEM_PROMPT];
     if (groupRules && groupRules.trim()) {
       blocks.push(`## 群规则\n\n${groupRules.trim()}`);
     }
     if (self.systemPrompt && self.systemPrompt.trim()) {
       blocks.push(`## 你的角色：${self.name}\n\n${self.systemPrompt.trim()}`);
+    }
+    if (recentContext && recentContext.trim()) {
+      blocks.push(
+        `## 最近对话（工作记忆，越靠下越新）\n\n${recentContext.trim()}\n\n` +
+          `用户可能在过程中补充或修改了要求 —— 以上面最新的为准，不要"失忆"。`,
+      );
     }
     const others = peers.filter((p) => p.agentId !== self.agentId);
     if (others.length > 0) {
@@ -199,6 +408,7 @@ export class MentionRouter {
     groupRules: string | null;
     conversationId: string;
     userContent: string | ContentPart[];
+    recentContext?: string;
     hop: number;
     send: (e: ServerEvent) => void;
   }): Promise<void> {
@@ -226,7 +436,7 @@ export class MentionRouter {
     const msgId = cryptoRandomId();
     const req: ChatRequest = {
       taskId: msgId,
-      systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules),
+      systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules, args.recentContext),
       messages: [{ role: 'user', content: args.userContent }],
       workspace: {
         id: args.conversationId,

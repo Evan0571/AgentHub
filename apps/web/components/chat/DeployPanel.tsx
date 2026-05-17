@@ -154,7 +154,7 @@ export function DeployPanel() {
             <span className="ml-1 text-text-muted/70">bundle ≈ {htmlKB} KB</span>
           </div>
         ) : (
-          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-xs text-amber-200">
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-200">
             当前会话还没有可部署的内容。先让 agent 用 ```tsx path=... 输出一个 React 项目。
           </div>
         )}
