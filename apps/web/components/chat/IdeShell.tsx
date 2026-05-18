@@ -4,27 +4,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import type { EditorProps } from '@monaco-editor/react';
 import {
+  Activity,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
   PanelLeftClose,
   PanelRightClose,
-  Braces,
-  File,
-  FileCode2,
-  FileText,
   Coins,
   Folder,
   GitBranch,
-  Image,
   Monitor,
-  Package,
   Plus,
   RefreshCw,
   Rocket,
   Save,
-  Settings,
   TerminalSquare,
   Trash2,
   X,
@@ -38,6 +32,8 @@ import { PlanCard } from './PlanCard';
 import { PreviewPanel } from './PreviewPanel';
 import { DeployPanel } from './DeployPanel';
 import { UsagePanel } from './UsagePanel';
+import { AgentActivityPanel } from './AgentActivityPanel';
+import { FileGlyph } from './FileGlyph';
 
 const MonacoEditor = dynamic<EditorProps>(
   () => import('@monaco-editor/react').then((mod) => mod.Editor),
@@ -50,6 +46,44 @@ const MonacoEditor = dynamic<EditorProps>(
     ),
   },
 );
+
+const configureMonacoThemes: NonNullable<EditorProps['beforeMount']> = (monaco) => {
+  monaco.editor.defineTheme('agenthub-light', {
+    base: 'vs',
+    inherit: true,
+    rules: [],
+    colors: {
+      'editor.background': '#ffffff',
+      'editor.foreground': '#1f2937',
+      'editorGutter.background': '#ffffff',
+      'editorLineNumber.foreground': '#94a3b8',
+      'editorLineNumber.activeForeground': '#0f766e',
+      'editor.lineHighlightBackground': '#f8fafc',
+      'editor.selectionBackground': '#99f6e455',
+      'editorCursor.foreground': '#0f766e',
+      'minimap.background': '#ffffff',
+      'scrollbarSlider.background': '#64748b33',
+      'scrollbarSlider.hoverBackground': '#64748b55',
+      'scrollbarSlider.activeBackground': '#64748b77',
+    },
+  });
+  monaco.editor.defineTheme('agenthub-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [],
+    colors: {
+      'editor.background': '#0b0d12',
+      'editor.foreground': '#e5e7eb',
+      'editorGutter.background': '#0b0d12',
+      'editorLineNumber.foreground': '#64748b',
+      'editorLineNumber.activeForeground': '#2dd4bf',
+      'editor.lineHighlightBackground': '#111827',
+      'editor.selectionBackground': '#2dd4bf33',
+      'editorCursor.foreground': '#2dd4bf',
+      'minimap.background': '#0b0d12',
+    },
+  });
+};
 
 interface WorkspaceFileEntry {
   path: string;
@@ -304,6 +338,11 @@ function ProjectPanel({
   const plan = useConversationStore((s) =>
     s.activeId ? s.plansByConv[s.activeId] : undefined,
   );
+  const activityCount = useConversationStore((s) =>
+    s.activeId
+      ? (s.agentActivityByConv[s.activeId] ?? []).filter((item) => item.status === 'running').length
+      : 0,
+  );
   const visibleMemberCount =
     activeConversation?.members.filter((m) => !isHiddenSystemAgentId(m.agentId)).length ?? 0;
 
@@ -333,6 +372,14 @@ function ProjectPanel({
           Files
         </ProjectTab>
         <ProjectTab
+          icon={<Activity className="h-3.5 w-3.5" />}
+          active={tab === 'activity'}
+          onClick={() => setTab('activity')}
+          badge={activityCount || undefined}
+        >
+          Activity
+        </ProjectTab>
+        <ProjectTab
           icon={<GitBranch className="h-3.5 w-3.5" />}
           active={tab === 'plan'}
           onClick={() => setTab('plan')}
@@ -355,6 +402,7 @@ function ProjectPanel({
         {tab === 'workspace' ? (
           <WorkspaceTree selectedPath={selectedPath} onSelectPath={onSelectPath} />
         ) : null}
+        {tab === 'activity' ? <AgentActivityPanel /> : null}
         {tab === 'plan' ? (
           plan ? (
             <PlanCard plan={plan} />
@@ -380,8 +428,15 @@ function WorkspaceTree({
   const activeId = useConversationStore((s) => s.activeId);
   const [list, setList] = useState<WorkspaceListResult | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['']));
+  const autoExpandedRef = useRef<Set<string>>(new Set(['']));
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setList(null);
+    setExpanded(new Set(['']));
+    autoExpandedRef.current = new Set(['']);
+  }, [activeId]);
 
   const refresh = useCallback(async () => {
     if (!activeId) return;
@@ -420,8 +475,13 @@ function WorkspaceTree({
     setExpanded((prev) => {
       const next = new Set(prev);
       for (const entry of list.files) {
-        if (entry.type === 'directory' && entry.path.split('/').length <= 1) {
+        if (
+          entry.type === 'directory' &&
+          entry.path.split('/').length <= 1 &&
+          !autoExpandedRef.current.has(entry.path)
+        ) {
           next.add(entry.path);
+          autoExpandedRef.current.add(entry.path);
         }
       }
       return next;
@@ -502,7 +562,6 @@ function TreeNodeRow({
   const isDirectory = node.type === 'directory';
   const isOpen = isDirectory && expanded.has(node.path);
   const isSelected = selectedPath === node.path;
-  const Icon = isDirectory ? Folder : iconForFile(node.name);
 
   return (
     <div>
@@ -513,27 +572,27 @@ function TreeNodeRow({
           else onSelectPath(node.path);
         }}
         className={clsx(
-          'group flex w-full items-center gap-1.5 rounded py-1.5 pr-2 text-left text-xs transition',
+          'group flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left text-[12.5px] font-medium transition',
           isSelected
-            ? 'bg-accent/20 text-text'
-            : 'text-text-muted hover:bg-white/5 hover:text-text',
+            ? 'bg-accent/15 text-text ring-1 ring-accent/25'
+            : 'text-text/85 hover:bg-white/5 hover:text-text',
         )}
         style={{ paddingLeft: 8 + depth * 14 }}
         title={node.path}
       >
         {isDirectory ? (
           isOpen ? (
-            <ChevronDown className="h-3 w-3 shrink-0 text-text-muted/70" />
+            <ChevronDown className="h-3 w-3 shrink-0 text-text-muted" />
           ) : (
-            <ChevronRight className="h-3 w-3 shrink-0 text-text-muted/70" />
+            <ChevronRight className="h-3 w-3 shrink-0 text-text-muted" />
           )
         ) : (
           <span className="w-3 shrink-0" />
         )}
-        <Icon className={clsx('h-3.5 w-3.5 shrink-0', iconColorForFile(node.name, isDirectory))} />
-        <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
+        <FileGlyph name={node.name} type={node.type} open={isOpen} />
+        <span className="min-w-0 flex-1 truncate">{node.name}</span>
         {!isDirectory && node.size !== undefined ? (
-          <span className="text-[9px] text-text-muted/50 opacity-0 group-hover:opacity-100">
+          <span className="text-[9px] text-text-muted/70 opacity-0 group-hover:opacity-100">
             {formatBytes(node.size)}
           </span>
         ) : null}
@@ -831,14 +890,7 @@ function CodeWorkbench({
                 : 'border-transparent bg-transparent text-text-muted',
             )}
           >
-            {file ? (
-              (() => {
-                const Icon = iconForFile(fileName);
-                return <Icon className={clsx('h-3.5 w-3.5 shrink-0', iconColorForFile(fileName, false))} />;
-              })()
-            ) : (
-              <File className="h-3.5 w-3.5 shrink-0" />
-            )}
+            <FileGlyph name={fileName} type="file" size="md" className={file ? undefined : 'opacity-60'} />
             <span className="truncate font-mono">{fileName}</span>
             {dirty ? <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent" /> : null}
           </div>
@@ -904,7 +956,8 @@ function CodeWorkbench({
           <div className="h-full min-h-0 bg-bg">
             <MonacoEditor
               key={file.path}
-              theme={theme === 'light' ? 'vs' : 'vs-dark'}
+              beforeMount={configureMonacoThemes}
+              theme={theme === 'light' ? 'agenthub-light' : 'agenthub-dark'}
               language={language}
               value={draft}
               onChange={(value) => setDraft(value ?? '')}
@@ -914,9 +967,10 @@ function CodeWorkbench({
                 cursorBlinking: 'smooth',
                 fontFamily: 'JetBrains Mono, ui-monospace, SFMono-Regular, Consolas, monospace',
                 fontLigatures: true,
-                fontSize: 12,
+                fontSize: 13,
+                fontWeight: '500',
                 guides: { bracketPairs: true, indentation: true },
-                lineHeight: 22,
+                lineHeight: 23,
                 minimap: { enabled: true, scale: 0.8 },
                 padding: { top: 12, bottom: 12 },
                 readOnly: file.truncated,
@@ -1360,32 +1414,6 @@ function buildWorkspaceTree(entries: WorkspaceFileEntry[]): WorkspaceTreeNode[] 
     .map(toNode);
 }
 
-function iconForFile(name: string) {
-  const ext = extensionOf(name);
-  if (name === 'package.json' || name.endsWith('.lock')) return Package;
-  if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'vue', 'svelte'].includes(ext)) return FileCode2;
-  if (['json', 'jsonc'].includes(ext)) return Braces;
-  if (['md', 'mdx', 'txt', 'log'].includes(ext)) return FileText;
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico'].includes(ext)) return Image;
-  if (['css', 'scss', 'sass', 'less'].includes(ext)) return FileText;
-  if (['lock', 'yaml', 'yml', 'toml', 'ini', 'env'].includes(ext) || isConfigFile(name)) return Settings;
-  return File;
-}
-
-function iconColorForFile(name: string, isDirectory: boolean): string {
-  if (isDirectory) return 'text-amber-300';
-  const ext = extensionOf(name);
-  if (['ts', 'tsx'].includes(ext)) return 'text-sky-300';
-  if (['js', 'jsx', 'mjs', 'cjs'].includes(ext)) return 'text-yellow-300';
-  if (['css', 'scss', 'sass', 'less'].includes(ext)) return 'text-pink-300';
-  if (['html', 'htm'].includes(ext)) return 'text-orange-300';
-  if (['json', 'jsonc'].includes(ext)) return 'text-emerald-300';
-  if (['md', 'mdx'].includes(ext)) return 'text-cyan-300';
-  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'ico'].includes(ext)) return 'text-lime-300';
-  if (isConfigFile(name)) return 'text-slate-300';
-  return 'text-text-muted';
-}
-
 function languageForFile(name: string): string {
   const ext = extensionOf(name);
   if (['ts', 'tsx'].includes(ext)) return 'typescript';
@@ -1432,19 +1460,6 @@ function mimeForName(name: string): string {
   if (IMAGE_EXT.has(e)) return `image/${e}`;
   if (e === 'pdf') return 'application/pdf';
   return 'application/octet-stream';
-}
-
-function isConfigFile(name: string): boolean {
-  const lower = name.toLowerCase();
-  return (
-    lower.startsWith('.') ||
-    lower.includes('config') ||
-    lower === 'dockerfile' ||
-    lower === 'makefile' ||
-    lower === 'tsconfig.json' ||
-    lower === 'vite.config.ts' ||
-    lower === 'next.config.ts'
-  );
 }
 
 function apiUrl(path: string): string {

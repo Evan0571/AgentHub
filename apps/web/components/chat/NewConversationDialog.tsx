@@ -14,7 +14,10 @@ const DEFAULT_GROUP_RULES = `- 全员使用中文回复，结论先行，避免�
 - 每个成员只输出自己身份负责的部分，不冒充其他成员。
 - 不使用 emoji，不写“我将/首先/接下来/总结/如需请告知”这类模板话。
 - 不要把工具调用过程复述进正文；正文只写交付结果、关键文件、验证结果和阻塞。
-- 信息不足但不阻断时先基于项目名称、附件和 workspace 文件做合理假设并推进。`;
+- 信息不足但不阻断时先基于项目名称、附件和 workspace 文件做合理假设并推进。
+- 关键选择会影响产品形态、数据来源、合规边界、部署成本或外部凭据时，先向用户提出具体问题/选项。
+- 共享决策、环境变量、Docker 服务、接口契约和交接写入 TEAM_MEMORY.md。
+- 禁止占位式交付：前端控件、图表、表格和后端能力必须有真实本地状态/数据流或明确配置说明。`;
 
 const MODEL_OPTIONS = [
   {
@@ -64,6 +67,24 @@ const SKILL_LIBRARY = [
     prompt: '完成实现后必须说明并尽量执行验证命令，失败时基于真实报错继续修复。',
   },
   {
+    id: 'env-docker',
+    label: 'Docker/配置',
+    prompt:
+      '需要数据库、缓存、队列、搜索或外部服务时，创建 .env.example、docker-compose.yml、schema/seed 或等价配置，并用可退出命令验证；Docker 不可用时报告真实错误和修复步骤。',
+  },
+  {
+    id: 'shared-memory',
+    label: '共享记忆',
+    prompt:
+      '把跨角色共享的产品/架构/接口/环境/阻塞/交接结论写入 TEAM_MEMORY.md，其他成员开始前先读它。',
+  },
+  {
+    id: 'no-placeholders',
+    label: '无占位交付',
+    prompt:
+      '禁止假图表、假 KPI、空卡片和只占位的按钮；每个可见控件都要连接真实本地状态、数据流、错误态或明确 disabled 的配置说明。',
+  },
+  {
     id: 'ui-polish',
     label: '界面打磨',
     prompt:
@@ -110,7 +131,7 @@ const ROLE_SLOTS = [
     summary: '目标、用户、范围、验收',
     // Codex (vision) — needs to read uploaded reference screenshots.
     defaultModel: 'codex' as ModelId,
-    defaultSkills: ['requirements', 'user-acceptance'] as SkillId[],
+    defaultSkills: ['requirements', 'shared-memory', 'user-acceptance'] as SkillId[],
   },
   {
     id: 'solution-architect',
@@ -120,7 +141,7 @@ const ROLE_SLOTS = [
     // Codex (gpt-4o) is vision-capable — the architect must be able to read
     // screenshots the user uploads when describing the project.
     defaultModel: 'codex' as ModelId,
-    defaultSkills: ['task-dag', 'api-contract', 'risk-scan'] as SkillId[],
+    defaultSkills: ['task-dag', 'api-contract', 'shared-memory', 'risk-scan'] as SkillId[],
   },
   {
     id: 'frontend-engineer',
@@ -128,7 +149,7 @@ const ROLE_SLOTS = [
     name: '前端工程师',
     summary: '页面、交互、预览产物',
     defaultModel: 'deepseek-v4-flash' as ModelId,
-    defaultSkills: ['workspace-first', 'ui-polish', 'design-system', 'terminal-verify'] as SkillId[],
+    defaultSkills: ['workspace-first', 'ui-polish', 'design-system', 'no-placeholders', 'terminal-verify'] as SkillId[],
   },
   {
     id: 'backend-engineer',
@@ -136,7 +157,7 @@ const ROLE_SLOTS = [
     name: '后端工程师',
     summary: 'API、数据、服务逻辑',
     defaultModel: 'deepseek-v4-flash' as ModelId,
-    defaultSkills: ['workspace-first', 'api-contract', 'terminal-verify'] as SkillId[],
+    defaultSkills: ['workspace-first', 'api-contract', 'env-docker', 'shared-memory', 'terminal-verify'] as SkillId[],
   },
   {
     id: 'code-reviewer',
@@ -152,7 +173,7 @@ const ROLE_SLOTS = [
     name: '环境配置员',
     summary: '依赖、脚本、部署前检查',
     defaultModel: 'deepseek-v4-flash' as ModelId,
-    defaultSkills: ['workspace-first', 'terminal-verify'] as SkillId[],
+    defaultSkills: ['workspace-first', 'env-docker', 'shared-memory', 'terminal-verify'] as SkillId[],
   },
   {
     id: 'qa-tester',
@@ -182,6 +203,67 @@ const ROLE_SLOTS = [
 
 type RoleId = (typeof ROLE_SLOTS)[number]['id'];
 
+const TEAM_BLUEPRINTS = [
+  {
+    id: 'full-squad',
+    name: '完整交付',
+    summary: '产品、架构、实现、验证全链路',
+    roleIds: [
+      'team-lead',
+      'product-analyst',
+      'solution-architect',
+      'frontend-engineer',
+      'backend-engineer',
+      'code-reviewer',
+      'env-engineer',
+      'qa-tester',
+      'senior-user',
+      'risk-critic',
+    ],
+    ruleNote: '适合端到端项目；先拆任务，再按角色并行推进，最后由 QA 与风险角色收口。',
+  },
+  {
+    id: 'lean-build',
+    name: '快速实现',
+    summary: '少角色推进，可写代码可验证',
+    roleIds: ['team-lead', 'solution-architect', 'frontend-engineer', 'backend-engineer', 'qa-tester', 'code-reviewer'],
+    ruleNote: '适合已有方向的实现任务；减少讨论，把规划、实现、验证压进同一轮推进。',
+  },
+  {
+    id: 'frontend-polish',
+    name: '体验打磨',
+    summary: '界面、交互、验收和风险',
+    roleIds: ['team-lead', 'product-analyst', 'frontend-engineer', 'senior-user', 'qa-tester', 'risk-critic'],
+    ruleNote: '适合 UI/UX 改造；优先产出可感知的界面变化，并用真实使用路径验收。',
+  },
+  {
+    id: 'audit-hardening',
+    name: '审查加固',
+    summary: '代码审查、测试、部署风险',
+    roleIds: ['team-lead', 'code-reviewer', 'risk-critic', 'qa-tester', 'env-engineer', 'backend-engineer', 'solution-architect'],
+    ruleNote: '适合上线前检查；先找会失败的地方，再给出最小修复和验证命令。',
+  },
+  {
+    id: 'research-plan',
+    name: '调研规划',
+    summary: '先澄清方向，再形成任务图',
+    roleIds: ['team-lead', 'product-analyst', 'solution-architect', 'senior-user', 'risk-critic'],
+    ruleNote: '适合不确定需求；输出清晰边界、方案取舍、任务 DAG 和下一步落地计划。',
+  },
+] as const satisfies readonly {
+  id: string;
+  name: string;
+  summary: string;
+  roleIds: readonly RoleId[];
+  ruleNote: string;
+}[];
+
+type TeamBlueprint = (typeof TEAM_BLUEPRINTS)[number];
+type BlueprintId = TeamBlueprint['id'] | 'custom';
+
+const buildBlueprintRules = (blueprint: TeamBlueprint) =>
+  `${DEFAULT_GROUP_RULES}\n- 团队蓝图：${blueprint.name}。${blueprint.ruleNote}`;
+
 type RoleConfig = {
   selected: boolean;
   modelId: ModelId;
@@ -189,18 +271,20 @@ type RoleConfig = {
   customSkills: string;
 };
 
-const initialRoleConfigs = (): Record<RoleId, RoleConfig> =>
-  Object.fromEntries(
+const initialRoleConfigs = (selectedRoleIds?: readonly RoleId[]): Record<RoleId, RoleConfig> => {
+  const selected = new Set<RoleId>(selectedRoleIds ?? ROLE_SLOTS.map((role) => role.id));
+  return Object.fromEntries(
     ROLE_SLOTS.map((role) => [
       role.id,
       {
-        selected: true,
+        selected: selected.has(role.id),
         modelId: role.defaultModel,
         skillIds: [...role.defaultSkills],
         customSkills: '',
       },
     ]),
   ) as Record<RoleId, RoleConfig>;
+};
 
 export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const agents = useConversationStore((s) => s.agents);
@@ -209,9 +293,12 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const [type, setType] = useState<'single' | 'group'>('group');
   const [title, setTitle] = useState('');
   const [singleSelected, setSingleSelected] = useState<Set<string>>(new Set());
-  const [roleConfigs, setRoleConfigs] = useState<Record<RoleId, RoleConfig>>(initialRoleConfigs);
+  const [roleConfigs, setRoleConfigs] = useState<Record<RoleId, RoleConfig>>(() =>
+    initialRoleConfigs(TEAM_BLUEPRINTS[0].roleIds),
+  );
   const [activeRoleId, setActiveRoleId] = useState<RoleId>('solution-architect');
-  const [groupRules, setGroupRules] = useState(DEFAULT_GROUP_RULES);
+  const [activeBlueprintId, setActiveBlueprintId] = useState<BlueprintId>(TEAM_BLUEPRINTS[0].id);
+  const [groupRules, setGroupRules] = useState(() => buildBlueprintRules(TEAM_BLUEPRINTS[0]));
   const [busy, setBusy] = useState(false);
   // Synchronous guard: React's setBusy is async, so a fast double-click /
   // Enter+click could both pass the !busy check and create the group twice.
@@ -245,10 +332,20 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
     (type === 'group' ? selectedRoleIds.length > 0 : singleSelected.size === 1);
 
   const setRoleConfig = (roleId: RoleId, patch: Partial<RoleConfig>) => {
+    setActiveBlueprintId('custom');
     setRoleConfigs((prev) => ({
       ...prev,
       [roleId]: { ...prev[roleId], ...patch },
     }));
+  };
+
+  const applyBlueprint = (blueprint: TeamBlueprint) => {
+    setActiveBlueprintId(blueprint.id);
+    setRoleConfigs(initialRoleConfigs(blueprint.roleIds));
+    setGroupRules(buildBlueprintRules(blueprint));
+    setActiveRoleId(
+      blueprint.roleIds.find((roleId) => availableRoleIds.has(roleId)) ?? blueprint.roleIds[0] ?? 'solution-architect',
+    );
   };
 
   const toggleRole = (roleId: RoleId) => {
@@ -265,8 +362,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   };
 
   const selectStandardTeam = () => {
-    setRoleConfigs(initialRoleConfigs());
-    setActiveRoleId('solution-architect');
+    applyBlueprint(TEAM_BLUEPRINTS[0]);
   };
 
   const selectSingleAgent = (id: string) => {
@@ -343,7 +439,42 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
         </label>
 
         {type === 'group' ? (
-          <div className="grid gap-3 lg:grid-cols-[1fr_1.08fr]">
+          <div className="space-y-3">
+            <section className="rounded-lg border border-white/10 bg-bg/35">
+              <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+                <div>
+                  <div className="text-xs font-semibold text-text">团队蓝图</div>
+                  <div className="text-[10px] text-text-muted">先选工作模式，再微调角色、模型和 Skills</div>
+                </div>
+                {activeBlueprintId === 'custom' ? (
+                  <span className="rounded bg-bg-soft px-2 py-1 text-[10px] text-text-muted">已自定义</span>
+                ) : null}
+              </div>
+              <div className="grid gap-1.5 p-2 sm:grid-cols-2 lg:grid-cols-5">
+                {TEAM_BLUEPRINTS.map((blueprint) => {
+                  const active = activeBlueprintId === blueprint.id;
+                  return (
+                    <button
+                      key={blueprint.id}
+                      type="button"
+                      onClick={() => applyBlueprint(blueprint)}
+                      title={blueprint.ruleNote}
+                      className={clsx(
+                        'min-h-[76px] rounded-md border px-2.5 py-2 text-left transition',
+                        active
+                          ? 'border-accent/45 bg-accent/10 text-text'
+                          : 'border-white/5 bg-bg/60 text-text-muted hover:border-white/15 hover:text-text',
+                      )}
+                    >
+                      <span className="block truncate text-xs font-semibold">{blueprint.name}</span>
+                      <span className="mt-1 block text-[10px] leading-snug text-text-muted">{blueprint.summary}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            <div className="grid gap-3 lg:grid-cols-[1fr_1.08fr]">
             <section className="rounded-lg border border-white/10 bg-bg/35">
               <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
                 <div>
@@ -481,6 +612,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
               </div>
             </section>
           </div>
+          </div>
         ) : (
           <section className="rounded-lg border border-white/10 bg-bg/35">
             <div className="border-b border-white/5 px-3 py-2">
@@ -522,7 +654,10 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
               <span className="text-[10px] uppercase tracking-wider text-text-muted">团队协议</span>
               <button
                 type="button"
-                onClick={() => setGroupRules(DEFAULT_GROUP_RULES)}
+                onClick={() => {
+                  setActiveBlueprintId('custom');
+                  setGroupRules(DEFAULT_GROUP_RULES);
+                }}
                 className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-accent hover:bg-accent/10"
               >
                 <Sparkles className="h-2.5 w-2.5" />
@@ -531,7 +666,10 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
             </div>
             <textarea
               value={groupRules}
-              onChange={(e) => setGroupRules(e.target.value)}
+              onChange={(e) => {
+                setActiveBlueprintId('custom');
+                setGroupRules(e.target.value);
+              }}
               rows={4}
               className="w-full resize-none rounded-md border border-white/10 bg-bg/60 px-2 py-1.5 text-xs leading-relaxed outline-none transition focus:border-accent/50 focus:ring-2 focus:ring-accent/10"
             />

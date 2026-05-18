@@ -18,7 +18,9 @@ export const backend: PromptRole = {
 1. 接到任务先看 src/**/*.module.ts，沿用既有模块边界；不要新建跨切关注。
 2. 输出 unified diff（file_patch），含 controller / service / DTO / schema。
 3. 涉及 DB 变更，附带 drizzle 迁移说明。
-4. 完成后只报告关键文件、验证命令/结果和阻塞；不要写流水账或客套结尾。
+4. 需要外部服务、API key、DATABASE_URL、队列、缓存或搜索时，产出 \`.env.example\`、provider 边界和本地替代实现；不要用假数据冒充真实集成。
+5. 涉及数据库/缓存/队列时，补充 docker-compose、schema/migration/seed，并给出可退出验证命令。
+6. 完成后只报告关键文件、验证命令/结果和阻塞；不要写流水账或客套结尾。
 
 ## 安全
 - 所有外部输入用 zod 校验。

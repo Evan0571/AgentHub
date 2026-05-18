@@ -17,6 +17,7 @@ import { ConversationsRepo } from '../db/conversations.repo.js';
 import { AgentToolRunnerService } from '../workspace/agent-tool-runner.service.js';
 import { WorkspaceService } from '../workspace/workspace.service.js';
 import { ProjectStateService } from '../workspace/project-state.service.js';
+import { TeamWakeService } from './team-wake.service.js';
 
 // Most conv-agents share one OpenAI key with a low TPM (e.g. 30k/min on
 // gpt-4o trial orgs). Running 4 heavy tasks at once instantly blows the
@@ -64,6 +65,7 @@ export class ExecutorService {
     private readonly toolRunner: AgentToolRunnerService,
     private readonly workspace: WorkspaceService,
     private readonly projectState: ProjectStateService,
+    private readonly teamWake: TeamWakeService,
   ) {}
 
   /**
@@ -86,6 +88,9 @@ export class ExecutorService {
     try {
     plan.status = 'executing';
     await this.plans.save(plan);
+    await this.workspace.syncTaskBoardFromPlan(plan.conversationId, plan).catch((error: unknown) => {
+      console.error('[executor] failed to sync task board', error);
+    });
     send({ op: 'plan_update', plan: snapshot(plan) });
 
     const byId = new Map(plan.tasks.map((t) => [t.id, t] as const));
@@ -137,6 +142,9 @@ export class ExecutorService {
     plan.updatedAt = new Date().toISOString();
     plan.version++;
     await this.plans.save(plan);
+    await this.workspace.syncTaskBoardFromPlan(plan.conversationId, plan).catch((error: unknown) => {
+      console.error('[executor] failed to sync final task board', error);
+    });
     send({ op: 'plan_update', plan: snapshot(plan) });
     } finally {
       this.runningPlans.delete(plan.id);
@@ -185,8 +193,14 @@ export class ExecutorService {
     const recentMsgs = await this.messages.list(plan.conversationId).catch(() => []);
     const recentContext = formatRecentContext(recentMsgs, 10);
     const conversation = await this.convs.getById(plan.conversationId).catch(() => null);
+    const teamRoster = renderTeamRoster(conversation?.members ?? []);
+    const taskBoard = renderTaskBoard(plan, task.id);
     const projectDoc = await this.workspace
       .readFile(plan.conversationId, { path: 'PROJECT.md', maxBytes: 8_000 })
+      .then((r) => r.content.trim())
+      .catch(() => '');
+    const teamMemoryDoc = await this.workspace
+      .readFile(plan.conversationId, { path: 'TEAM_MEMORY.md', maxBytes: 8_000 })
       .then((r) => r.content.trim())
       .catch(() => '');
     await this.projectState.setGoalIfEmpty(plan.conversationId, plan.rootGoal);
@@ -196,6 +210,8 @@ export class ExecutorService {
       (assignee.systemPrompt
         ? `## 你的角色：${assignee.name}\n\n${assignee.systemPrompt.trim()}\n\n`
         : '') +
+      (teamRoster ? `## 团队名册与交接规则\n\n${teamRoster}\n\n` : '') +
+      (taskBoard ? `## 当前任务看板\n\n${taskBoard}\n\n` : '') +
       '你是 AgentHub 项目团队中的子任务执行 Agent，工作在一个真实的项目工作区里。\n\n' +
       '**工作方式（必须遵守）**：\n' +
       '1. 这是真实文件系统：用 workspace_write / workspace_write_many 把代码真正写进文件，不要只在聊天里贴代码。\n' +
@@ -204,8 +220,12 @@ export class ExecutorService {
       '4. 写完后自己用 terminal_run 跑构建/类型检查验证；报错就继续修，直到通过。\n' +
       '5. **禁止占用 3000 / 4000 端口**（用户本机服务在用）；要起服务用 5173/8080 等其它端口，且优先用会退出的命令（npm run build / tsc）验证，不要长跑 dev server（npm run start / vite 常驻）。\n' +
       '6. 不要急、允许多轮迭代：先打通最小闭环再增强。改了会影响别人的东西（接口契约/文件结构/共享类型）要在回复里 @ 受影响角色对齐；需求不确定且代价大时 @ 用户问清楚再做。\n' +
-      '7. 输出克制：不要 emoji；不要写"我将/首先/接下来/总结/如需请告知"模板句；不要复述工具调用流水账。\n' +
-      '8. 最终正文只写交付结果、关键文件、验证结果和下一步阻塞。任务没真正可运行前不要宣称完成。' +
+      '7. 共享记忆：开始前优先读 PROJECT.md、TEAM_MEMORY.md 和任务相关真实文件；最终回答前必须做 memory review。改了共享契约、环境变量、数据模型、接口、验收口径、部署方式、角色交接或本地设置时，先用 memory_note 写入对应记忆层；没有持久事实变化就不要写。\n' +
+      '8. 配置与外部依赖：需要用户提供 key/token/URL 时，写 `.env.example`，列出变量名、用途和是否必填。可以先实现本地 provider/mock，但必须明确隔离，不能把假数据伪装成真实能力。\n' +
+      '9. Docker/数据库/缓存/队列：如果任务需要本地基础设施，创建或更新 `docker-compose.yml`、schema/migration/seed，并用 terminal_run 运行 `docker compose config` 或可退出的诊断命令；如果 Docker CLI/daemon 不可用，保留真实错误并说明用户要安装/启动什么。\n' +
+      '10. 产品质量：前端必须贴合具体领域和用户工作流。不要蓝紫渐变 AI 模板、空卡片、占位 KPI、假图表；每个按钮/筛选/表格/图表都要有真实本地状态、数据流、错误态或明确 disabled 的下一步说明。\n' +
+      '11. 输出克制：不要 emoji；不要写"我将/首先/接下来/总结/如需请告知"模板句；不要复述工具调用流水账。\n' +
+      '12. 最终正文只写交付结果、关键文件、验证结果和下一步阻塞。任务没真正可运行前不要宣称完成。' +
       (projectMemory ? `\n\n${projectMemory}` : '') +
       (recentContext
         ? `\n\n## 最近对话（工作记忆，越靠下越新）\n\n${recentContext}\n\n` +
@@ -215,6 +235,7 @@ export class ExecutorService {
     const baseUserMsg =
       (conversation?.title ? `项目名称：${conversation.title}\n\n` : '') +
       (projectDoc ? `PROJECT.md 当前内容：\n${projectDoc}\n\n` : '') +
+      (teamMemoryDoc ? `TEAM_MEMORY.md 当前内容：\n${teamMemoryDoc}\n\n` : '') +
       `任务目标：${task.goal}\n\n` +
       (upstreamContext ? `${upstreamContext}\n\n` : '') +
       `请在工作区里实现本任务（真实写文件 + 自测）。`;
@@ -349,6 +370,10 @@ export class ExecutorService {
     // toolRunner ran with suppressDone:true so the message stayed streaming
     // and the live activity feed was visible the entire time.
     send({ op: 'msg_done', msgId });
+    await this.teamWake.processPending(plan.conversationId, send, {
+      reason: `task handoff after ${task.id}`,
+      maxItems: 3,
+    });
 
     if (agentErrored) {
       void this.projectState.recordOutcome(plan.conversationId, {
@@ -533,6 +558,9 @@ export class ExecutorService {
     plan.updatedAt = new Date().toISOString();
     plan.version++;
     void this.plans.save(plan);
+    void this.workspace.syncTaskBoardFromPlan(plan.conversationId, plan).catch((syncError: unknown) => {
+      console.error('[executor] failed to sync task board', syncError);
+    });
     send({ op: 'plan_update', plan: snapshot(plan) });
   }
 }
@@ -583,6 +611,38 @@ function collectUpstream(task: PlanTask, plan: Plan): string {
   );
 }
 
+function renderTeamRoster(
+  members: Array<{
+    agentId: string;
+    name: string;
+    adapterId: string;
+    systemPrompt?: string | null;
+  }>,
+): string {
+  const visible = members.filter((m) => m.agentId !== 'orchestrator' && m.agentId !== 'mock');
+  if (visible.length === 0) return '';
+  const lines = visible.map((member) => {
+    const role = summarizeRole(member.systemPrompt) || member.adapterId;
+    return `- ${member.name} (@${shortAgentId(member.agentId)}): ${role}`;
+  });
+  return [
+    lines.join('\n'),
+    '',
+    '交接规则：改共享接口、文件结构、数据模型、验证命令、环境变量或部署方式时，点名受影响角色并说明变化；把持久结论写入 TEAM_MEMORY.md；遇到阻塞要写清事实、失败命令和下一位成员需要接手的内容。',
+  ].join('\n');
+}
+
+function renderTaskBoard(plan: Plan, currentTaskId: string): string {
+  const lines = plan.tasks.slice(0, 16).map((item) => {
+    const current = item.id === currentTaskId ? ' current' : '';
+    const owner = item.assigneeAgentId ? `@${shortAgentId(item.assigneeAgentId)}` : 'unassigned';
+    const deps = item.inputs.length > 0 ? ` after ${item.inputs.join(',')}` : '';
+    return `- ${item.id}${current} [${item.status}] ${owner}${deps}: ${item.goal}`;
+  });
+  const hidden = plan.tasks.length > lines.length ? `\n- ... ${plan.tasks.length - lines.length} more tasks hidden` : '';
+  return `${lines.join('\n')}${hidden}`;
+}
+
 /** One-line gist of an upstream reply (no code dump). */
 function gist(text: string | undefined): string {
   if (!text) return '（无说明）';
@@ -607,4 +667,17 @@ function sleep(ms: number) {
 
 function cryptoRandomId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+function summarizeRole(systemPrompt: string | null | undefined): string {
+  if (!systemPrompt) return '';
+  return systemPrompt
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
+function shortAgentId(agentId: string): string {
+  const match = /^conv-agent-[0-9a-fA-F-]{36}-(.+)$/.exec(agentId);
+  return match?.[1] ?? agentId;
 }

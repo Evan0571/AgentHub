@@ -1,7 +1,20 @@
 'use client';
 
 import { memo, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, FileText, Image as ImageIcon, Sparkles } from 'lucide-react';
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clock3,
+  FileText,
+  HelpCircle,
+  Image as ImageIcon,
+  Sparkles,
+  TerminalSquare,
+  Wrench,
+} from 'lucide-react';
 import clsx from 'clsx';
 import { useConversationStore, type ChatMessage, EMPTY_MESSAGES } from '@/lib/store';
 import type { MessageAttachment } from '@agenthub/shared-types';
@@ -66,8 +79,10 @@ function MessageRowImpl({ m }: { m: ChatMessage }) {
               : 'rounded-tl-sm border-white/7 bg-bg-soft/70 text-text',
           )}
         >
+          {!isUser ? <AgentRunStatus message={m} /> : null}
+
           {m.thinking ? (
-            <ThinkingBlock text={m.thinking} streaming={!!m.streaming && !m.text} />
+            <ThinkingBlock text={m.thinking} streaming={!!m.streaming} statusText={m.lastActivityTitle} />
           ) : null}
 
           {m.text ? (
@@ -178,6 +193,129 @@ function StreamingDots() {
   );
 }
 
+function AgentRunStatus({ message }: { message: ChatMessage }) {
+  const live = !!message.streaming;
+  const now = useTicker(live);
+  const startedAt = parseMs(message.startedAt ?? message.createdAt) ?? now;
+  const lastEventAt = parseMs(message.lastEventAt ?? message.startedAt ?? message.createdAt) ?? startedAt;
+  const finishedAt = parseMs(message.finishedAt);
+  const elapsedMs = (live ? now : finishedAt ?? lastEventAt) - startedAt;
+  const idleMs = live ? now - lastEventAt : 0;
+  const slow = live && idleMs >= 15_000;
+  const stale = live && idleMs >= 45_000;
+  const waitingUser = message.lastAgentState === 'waiting_user';
+  const blocked = message.lastAgentState === 'blocked';
+  const failed = message.lastActivityStatus === 'failed' || message.lastAgentState === 'failed';
+  const hasUsefulStatus =
+    live || failed || blocked || waitingUser || message.lastActivityTitle || (message.tokenChars ?? 0) > 0;
+
+  if (!hasUsefulStatus) return null;
+
+  const Icon = statusIcon(message, live, stale, failed);
+  const tone = failed
+    ? 'failed'
+    : blocked
+      ? 'stale'
+      : waitingUser
+        ? 'waiting'
+        : stale
+          ? 'stale'
+          : slow
+            ? 'slow'
+            : live
+              ? 'running'
+              : 'done';
+  const primary = statusPrimary(message, live, slow, stale, failed);
+  const detail = statusDetail(message, live, idleMs);
+
+  return (
+    <div
+      className={clsx(
+        'mb-2 rounded-lg border px-2.5 py-2 text-[11px] font-medium',
+        tone === 'running' &&
+          'border-teal-500/35 bg-teal-50 text-teal-700 dark:border-accent/25 dark:bg-accent/5 dark:text-accent',
+        tone === 'slow' &&
+          'border-amber-500/40 bg-amber-50 text-amber-700 dark:border-amber-400/25 dark:bg-amber-400/5 dark:text-amber-300',
+        tone === 'waiting' &&
+          'border-sky-500/35 bg-sky-50 text-sky-700 dark:border-sky-400/25 dark:bg-sky-400/5 dark:text-sky-300',
+        tone === 'stale' &&
+          'border-rose-500/35 bg-rose-50 text-rose-700 dark:border-rose-400/25 dark:bg-rose-400/5 dark:text-rose-300',
+        tone === 'failed' &&
+          'border-rose-500/35 bg-rose-50 text-rose-700 dark:border-rose-400/25 dark:bg-rose-400/5 dark:text-rose-300',
+        tone === 'done' &&
+          'border-emerald-500/35 bg-emerald-50 text-emerald-700 dark:border-emerald-400/20 dark:bg-emerald-400/5 dark:text-emerald-300',
+      )}
+    >
+      <div className="flex min-w-0 items-center gap-2">
+        <Icon className={clsx('h-3.5 w-3.5 shrink-0', live && !stale && !failed && 'animate-pulse')} />
+        <span className="min-w-0 flex-1 truncate font-medium">{primary}</span>
+        <span className="shrink-0 font-mono text-[10px] opacity-80">{formatDuration(elapsedMs)}</span>
+      </div>
+      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] opacity-80">
+        <span>{detail}</span>
+        {(message.tokenChars ?? 0) > 0 ? <span>{message.tokenChars} chars</span> : null}
+        {(message.thinkingChars ?? 0) > 0 ? <span>{message.thinkingChars} log chars</span> : null}
+      </div>
+      {message.lastActivityDetail && live ? (
+        <div className="mt-1 truncate font-mono text-[10px] opacity-75">{message.lastActivityDetail}</div>
+      ) : null}
+    </div>
+  );
+}
+
+function useTicker(enabled: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [enabled]);
+  return enabled ? now : Date.now();
+}
+
+function statusIcon(message: ChatMessage, live: boolean, stale: boolean, failed: boolean) {
+  if (failed || stale) return AlertTriangle;
+  if (message.lastAgentState === 'waiting_user') return HelpCircle;
+  if (message.lastAgentState === 'blocked') return AlertTriangle;
+  if (!live) return CheckCircle2;
+  if (message.lastActivityKind === 'terminal') return TerminalSquare;
+  if (message.lastActivityKind === 'stream') return Activity;
+  if (message.lastActivityTitle) return Wrench;
+  return Clock3;
+}
+
+function statusPrimary(
+  message: ChatMessage,
+  live: boolean,
+  slow: boolean,
+  stale: boolean,
+  failed: boolean,
+): string {
+  if (failed) return message.lastActivityTitle ?? 'Agent failed';
+  if (message.lastAgentState === 'waiting_user') return 'Waiting for your answer';
+  if (message.lastAgentState === 'blocked') return message.lastAgentStateReason ?? 'Agent is blocked';
+  if (!live) return message.lastActivityTitle ? `Done: ${message.lastActivityTitle}` : 'Response complete';
+  if (stale) return 'No update for a while';
+  if (slow) return 'Still running, waiting for next stream event';
+  if (message.lastActivityTitle) return message.lastActivityTitle;
+  if (message.text) return 'Writing response';
+  if (message.thinking) return 'Running tool loop';
+  return 'Waiting for model stream';
+}
+
+function statusDetail(message: ChatMessage, live: boolean, idleMs: number): string {
+  if (message.lastAgentState === 'waiting_user') {
+    return message.lastAgentStateReason ?? 'answer the question panel below to continue';
+  }
+  if (message.lastAgentState === 'blocked') {
+    return message.lastAgentStateReason ?? 'blocked; needs user or environment action';
+  }
+  if (!live) return message.finishedAt ? `finished ${timeAgo(message.finishedAt)}` : 'finished';
+  const idle = formatDuration(idleMs);
+  if (idleMs >= 45_000) return `last update ${idle} ago; backend watchdog is still active`;
+  return `last update ${idle} ago`;
+}
+
 function ClientTime({ iso }: { iso: string }) {
   const [text, setText] = useState('');
   useEffect(() => {
@@ -201,7 +339,26 @@ function formatBytes(bytes: number): string {
   return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
 }
 
-function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }) {
+function parseMs(iso: string | undefined): number | null {
+  if (!iso) return null;
+  const value = new Date(iso).getTime();
+  return Number.isFinite(value) ? value : null;
+}
+
+function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${seconds.toString().padStart(2, '0')}s`;
+}
+
+function timeAgo(iso: string): string {
+  const ms = Date.now() - (parseMs(iso) ?? Date.now());
+  return `${formatDuration(ms)} ago`;
+}
+
+function ThinkingBlock({ text, streaming, statusText }: { text: string; streaming: boolean; statusText?: string }) {
   // Auto-expand while reasoning is still streaming; user can collapse manually
   // by clicking the header. Once streaming ends, default to collapsed.
   const [userToggled, setUserToggled] = useState(false);
@@ -232,6 +389,9 @@ function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }
         <span className="font-medium">
           {streaming ? '执行中' : '工具活动'}
         </span>
+        {streaming && statusText ? (
+          <span className="min-w-0 truncate text-text-muted/75">{statusText}</span>
+        ) : null}
         {!open && lastLine ? (
           <span className="ml-1 truncate text-text-muted/70 italic">— {lastLine}</span>
         ) : null}

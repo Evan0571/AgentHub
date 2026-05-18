@@ -7,7 +7,7 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import type { WebSocket, Server } from 'ws';
-import type { ClientEvent, ServerEvent } from '@agenthub/shared-types';
+import { PROJECT_PLANNER_MENTION, type ClientEvent, type ServerEvent } from '@agenthub/shared-types';
 import { ConversationService } from './conversation.service.js';
 import { MentionRouter } from './mention-router.js';
 import { OrchestratorService } from '../orchestrator/orchestrator.service.js';
@@ -62,6 +62,20 @@ export class ConversationGateway {
         await this.conv.handleUserMessage(event, send);
         await this.mention.route(event, send, this.orchestrator);
         return;
+      case 'answer_user_question': {
+        const resumed: Extract<ClientEvent, { op: 'user_msg' }> = {
+          op: 'user_msg',
+          conversationId: event.conversationId,
+          content: {
+            kind: 'text',
+            text: formatQuestionAnswerResume(event.resumePrompt, event.answers),
+          },
+          mentions: [PROJECT_PLANNER_MENTION],
+        };
+        await this.conv.handleUserMessage(resumed, send);
+        await this.mention.route(resumed, send, this.orchestrator);
+        return;
+      }
       case 'cancel':
         await this.orchestrator.cancel(event.taskId);
         return;
@@ -101,4 +115,22 @@ export class ConversationGateway {
       if (oldest) this.seenClientEventIds.delete(oldest);
     }
   }
+}
+
+function formatQuestionAnswerResume(
+  resumePrompt: string,
+  answers: Extract<ClientEvent, { op: 'answer_user_question' }>['answers'],
+): string {
+  const lines = [
+    resumePrompt.trim(),
+    '',
+    '用户已回答澄清问题：',
+    ...answers.map((item) => {
+      const suffix = item.notes ? `；补充：${item.notes}` : '';
+      return `- ${item.question} => ${item.answer}${suffix}`;
+    }),
+    '',
+    '请基于这些明确选择继续推进。不要再次询问已经回答的问题；如果仍有高代价歧义，再发起新的结构化问题。',
+  ];
+  return lines.filter(Boolean).join('\n');
 }

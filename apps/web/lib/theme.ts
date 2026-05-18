@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 export type Theme = 'light' | 'dark';
 
 const STORAGE_KEY = 'agenthub-theme';
+const THEME_EVENT = 'agenthub-theme-change';
 
 /**
  * Read the active theme from <html>'s class list. The class is set by the
@@ -25,13 +26,29 @@ function applyTheme(theme: Theme) {
   } catch {
     /* private-mode / disabled storage — fine to ignore */
   }
+  window.dispatchEvent(new CustomEvent<Theme>(THEME_EVENT, { detail: theme }));
 }
 
 export function useTheme(): { theme: Theme; setTheme: (t: Theme) => void; toggle: () => void } {
-  const [theme, setThemeState] = useState<Theme>('dark');
+  const [theme, setThemeState] = useState<Theme>(() => readTheme());
 
   useEffect(() => {
-    setThemeState(readTheme());
+    const syncTheme = () => setThemeState(readTheme());
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === STORAGE_KEY) syncTheme();
+    };
+    const observer = new MutationObserver(syncTheme);
+
+    syncTheme();
+    window.addEventListener(THEME_EVENT, syncTheme);
+    window.addEventListener('storage', onStorage);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+
+    return () => {
+      window.removeEventListener(THEME_EVENT, syncTheme);
+      window.removeEventListener('storage', onStorage);
+      observer.disconnect();
+    };
   }, []);
 
   const setTheme = (t: Theme) => {
@@ -39,7 +56,7 @@ export function useTheme(): { theme: Theme; setTheme: (t: Theme) => void; toggle
     setThemeState(t);
   };
 
-  const toggle = () => setTheme(theme === 'dark' ? 'light' : 'dark');
+  const toggle = () => setTheme(readTheme() === 'dark' ? 'light' : 'dark');
 
   return { theme, setTheme, toggle };
 }

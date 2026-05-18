@@ -1,9 +1,53 @@
 import type { ID, ISODateTime, Message, MessageContent } from './domain.js';
 import type { Plan, PlanEdit } from './plan.js';
 
+export type AgentRuntimeState =
+  | 'running'
+  | 'waiting_user'
+  | 'blocked'
+  | 'idle'
+  | 'failed';
+
+export interface UserQuestionOption {
+  id: ID;
+  label: string;
+  description: string;
+  recommended?: boolean;
+  preview?: string;
+}
+
+export interface UserQuestion {
+  id: ID;
+  header: string;
+  question: string;
+  options: UserQuestionOption[];
+  multiSelect?: boolean;
+}
+
+export interface UserQuestionRequest {
+  id: ID;
+  conversationId: ID;
+  sourceAgentId?: ID;
+  sourceAgentName: string;
+  title: string;
+  reason?: string;
+  questions: UserQuestion[];
+  resumePrompt: string;
+  createdAt: ISODateTime;
+}
+
+export interface UserQuestionAnswer {
+  questionId: ID;
+  question: string;
+  answer: string;
+  optionIds: ID[];
+  notes?: string;
+}
+
 /** Client → Server */
 export type ClientEvent =
   | { op: 'user_msg'; conversationId: ID; content: MessageContent; mentions: ID[]; replyToId?: ID; clientEventId?: string }
+  | { op: 'answer_user_question'; conversationId: ID; requestId: ID; answers: UserQuestionAnswer[]; resumePrompt: string }
   | { op: 'cancel'; taskId: ID }
   | { op: 'accept_patch'; snapshotId: ID; hunkIds: string[] }
   | { op: 'reject_patch'; snapshotId: ID; hunkIds: string[] }
@@ -18,6 +62,17 @@ export type ClientEvent =
 /** Server → Client */
 export type ServerEvent =
   | { op: 'client_event_ack'; clientEventId: string }
+  | { op: 'ask_user_question'; request: UserQuestionRequest }
+  | {
+      op: 'agent_state';
+      conversationId: ID;
+      agentId?: ID;
+      agentName: string;
+      msgId?: ID;
+      state: AgentRuntimeState;
+      reason?: string;
+      updatedAt: ISODateTime;
+    }
   | { op: 'msg_started'; message: Pick<Message, 'id' | 'conversationId' | 'senderType' | 'senderId' | 'createdAt' | 'replyToId'> }
   | { op: 'msg_token'; msgId: ID; delta: string }
   | { op: 'msg_thinking'; msgId: ID; delta: string }
@@ -25,6 +80,20 @@ export type ServerEvent =
   | { op: 'msg_error'; msgId: ID; error: ErrorPayload }
   | { op: 'msg_recall'; msgId: ID }
   | { op: 'patch'; msgId: ID; snapshotId: ID; files: FileDiffSummary[] }
+  | {
+      op: 'agent_activity';
+      activityId: ID;
+      conversationId: ID;
+      msgId: ID;
+      agentId?: ID;
+      agentName: string;
+      kind: 'workspace' | 'terminal' | 'file' | 'stream';
+      toolName?: string;
+      status: 'running' | 'succeeded' | 'failed';
+      title: string;
+      detail?: string;
+      createdAt: ISODateTime;
+    }
   | { op: 'plan_update'; plan: Plan }
   | { op: 'plan_conflict'; planId: ID; serverVersion: number; clientVersion: number }
   | { op: 'dep_suggestion'; planId: ID; requestId: string; suggestedInputs: ID[]; reasoning?: string }

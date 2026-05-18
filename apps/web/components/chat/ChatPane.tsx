@@ -8,6 +8,7 @@ import { baseRoleIdFromConvAgent, isHiddenSystemAgentId, prettyAgentName, useCon
 import { MentionPicker, type MentionCandidate } from './MentionPicker';
 import { Banner } from '../Banner';
 import { MembersPanel } from './MembersPanel';
+import { QuestionPromptPanel } from './QuestionPromptPanel';
 
 interface MentionState {
   /** Index of the '@' that opened the picker. */
@@ -376,6 +377,8 @@ export function ChatPane() {
       <MessageList conversationId={active.id} />
 
       <footer className="relative border-t border-white/5 px-4 py-3">
+        <QuestionPromptPanel conversationId={active.id} />
+
         {mention ? (
           <div className="absolute bottom-full left-4 right-4 mb-2">
             <MentionPicker

@@ -1,7 +1,16 @@
 'use client';
 
 import { create } from 'zustand';
-import { type ServerEvent, type Plan, type PlanEdit, type MessageAttachment, PROJECT_PLANNER_MENTION } from '@agenthub/shared-types';
+import {
+  type AgentRuntimeState,
+  type ServerEvent,
+  type Plan,
+  type PlanEdit,
+  type MessageAttachment,
+  type UserQuestionAnswer,
+  type UserQuestionRequest,
+  PROJECT_PLANNER_MENTION,
+} from '@agenthub/shared-types';
 import { AgentHubWS } from './ws-client';
 
 export interface ChatMessage {
@@ -16,6 +25,17 @@ export interface ChatMessage {
   attachments?: MessageAttachment[];
   thinking?: string;
   streaming?: boolean;
+  startedAt?: string;
+  lastEventAt?: string;
+  finishedAt?: string;
+  lastActivityTitle?: string;
+  lastActivityDetail?: string;
+  lastActivityKind?: AgentActivityEntry['kind'];
+  lastActivityStatus?: AgentActivityEntry['status'];
+  lastAgentState?: AgentRuntimeState;
+  lastAgentStateReason?: string;
+  tokenChars?: number;
+  thinkingChars?: number;
   createdAt: string;
 }
 
@@ -120,7 +140,7 @@ export interface ChatConversation {
   preview?: string;
 }
 
-export type RightPanelTab = 'workspace' | 'plan' | 'preview' | 'deploy' | 'usage';
+export type RightPanelTab = 'workspace' | 'team' | 'activity' | 'permissions' | 'plan' | 'preview' | 'deploy' | 'usage';
 
 export interface ModelUsageRow {
   adapterId: string;
@@ -156,6 +176,31 @@ export interface AgentTerminalEntry {
   createdAt: string;
 }
 
+export interface AgentActivityEntry {
+  id: string;
+  conversationId: string;
+  msgId: string;
+  agentId?: string;
+  agentName: string;
+  kind: 'workspace' | 'terminal' | 'file' | 'stream';
+  toolName?: string;
+  status: 'running' | 'succeeded' | 'failed';
+  title: string;
+  detail?: string;
+  createdAt: string;
+}
+
+export interface AgentStateEntry {
+  id: string;
+  conversationId: string;
+  agentId?: string;
+  agentName: string;
+  msgId?: string;
+  state: AgentRuntimeState;
+  reason?: string;
+  updatedAt: string;
+}
+
 export interface Deployment {
   deploymentId: string;
   conversationId: string;
@@ -175,6 +220,9 @@ interface State {
   deploymentsByConv: Record<string, Deployment[]>;
   usageByConv: Record<string, ConversationUsage>;
   agentTerminalByConv: Record<string, AgentTerminalEntry[]>;
+  agentActivityByConv: Record<string, AgentActivityEntry[]>;
+  agentStatesByConv: Record<string, AgentStateEntry[]>;
+  pendingQuestionsByConv: Record<string, UserQuestionRequest[]>;
   rightPanelTab: RightPanelTab;
   /** uid of the code block selected for preview; null = auto-pick latest runnable. */
   previewBlockUid: string | null;
@@ -190,6 +238,12 @@ interface State {
    */
   openPreview: (blockUid: string, opts?: { setEntry?: boolean }) => void;
   sendUserMessage: (conversationId: string, text: string, attachments?: MessageAttachment[]) => void;
+  answerUserQuestion: (
+    conversationId: string,
+    requestId: string,
+    answers: UserQuestionAnswer[],
+    resumePrompt: string,
+  ) => void;
   /** Apply plan edits with optimistic concurrency (baseVersion). Server is authoritative. */
   editPlan: (planId: string, edits: PlanEdit[]) => void;
   /** Re-run one failed/cancelled plan task from the Plan panel. */
@@ -421,6 +475,14 @@ function inferMentions(conv: ChatConversation | undefined, text: string): string
   return [PROJECT_PLANNER_MENTION];
 }
 
+function formatQuestionAnswerMessage(answers: UserQuestionAnswer[]): string {
+  const lines = ['我对关键问题的确认：'];
+  for (const item of answers) {
+    lines.push(`- ${item.question}：${item.answer}${item.notes ? `（补充：${item.notes}）` : ''}`);
+  }
+  return lines.join('\n');
+}
+
 export const useConversationStore = create<State>((set, get) => ({
   conversations: [],
   agents: [],
@@ -429,6 +491,9 @@ export const useConversationStore = create<State>((set, get) => ({
   deploymentsByConv: {},
   usageByConv: {},
   agentTerminalByConv: {},
+  agentActivityByConv: {},
+  agentStatesByConv: {},
+  pendingQuestionsByConv: {},
   rightPanelTab: 'workspace',
   previewBlockUid: null,
   banner: null,
@@ -602,6 +667,39 @@ export const useConversationStore = create<State>((set, get) => ({
     });
   },
 
+  answerUserQuestion: (conversationId, requestId, answers, resumePrompt) => {
+    get().ensureConnected();
+    const text = formatQuestionAnswerMessage(answers);
+    const userMsg: ChatMessage = {
+      id: 'qa' + Date.now(),
+      conversationId,
+      senderType: 'user',
+      senderName: '我',
+      avatarColor: '#0f766e',
+      text,
+      createdAt: new Date().toISOString(),
+    };
+    set((s) => ({
+      pendingQuestionsByConv: {
+        ...s.pendingQuestionsByConv,
+        [conversationId]: (s.pendingQuestionsByConv[conversationId] ?? []).filter(
+          (item) => item.id !== requestId,
+        ),
+      },
+      messagesByConv: {
+        ...s.messagesByConv,
+        [conversationId]: [...(s.messagesByConv[conversationId] ?? []), userMsg],
+      },
+    }));
+    get().ws!.send({
+      op: 'answer_user_question',
+      conversationId,
+      requestId,
+      answers,
+      resumePrompt,
+    });
+  },
+
   // ----- conversation / member / agent management ---------------------
 
   refreshAgents: async () => {
@@ -670,10 +768,26 @@ export const useConversationStore = create<State>((set, get) => ({
     if (!r.ok && r.status !== 204) throw new Error(`delete conv ${r.status}`);
     set((s) => {
       const next = s.conversations.filter((c) => c.id !== id);
+      const { [id]: _activity, ...agentActivityByConv } = s.agentActivityByConv;
+      const { [id]: _terminal, ...agentTerminalByConv } = s.agentTerminalByConv;
+      const { [id]: _agentStates, ...agentStatesByConv } = s.agentStatesByConv;
+      const { [id]: _questions, ...pendingQuestionsByConv } = s.pendingQuestionsByConv;
+      const { [id]: _usage, ...usageByConv } = s.usageByConv;
+      const { [id]: _deployments, ...deploymentsByConv } = s.deploymentsByConv;
+      const { [id]: _plan, ...plansByConv } = s.plansByConv;
+      const { [id]: _messages, ...messagesByConv } = s.messagesByConv;
       return {
         conversations: next,
         activeId: s.activeId === id ? next[0]?.id ?? null : s.activeId,
         agents: s.agents.filter((a) => !a.id.startsWith(`conv-agent-${id}-`)),
+        agentActivityByConv,
+        agentTerminalByConv,
+        agentStatesByConv,
+        pendingQuestionsByConv,
+        usageByConv,
+        deploymentsByConv,
+        plansByConv,
+        messagesByConv,
       };
     });
   },
@@ -792,6 +906,7 @@ function flushPendingTokens(
   const all = get().messagesByConv;
   const next: Record<string, ChatMessage[]> = { ...all };
   let touched = false;
+  const now = new Date().toISOString();
   for (const [msgId, deltas] of pending) {
     for (const cid in next) {
       const arr = next[cid]!;
@@ -803,6 +918,9 @@ function flushPendingTokens(
               ...m,
               text: m.text + deltas.text,
               thinking: (m.thinking ?? '') + deltas.thinking,
+              lastEventAt: now,
+              tokenChars: (m.tokenChars ?? 0) + deltas.text.length,
+              thinkingChars: (m.thinkingChars ?? 0) + deltas.thinking.length,
             }
           : m,
       );
@@ -819,6 +937,54 @@ function handleServerEvent(
   get: () => State,
 ) {
   switch (ev.op) {
+    case 'ask_user_question': {
+      const req = ev.request;
+      set((s) => {
+        const prev = s.pendingQuestionsByConv[req.conversationId] ?? [];
+        const next = [...prev.filter((item) => item.id !== req.id), req].slice(-10);
+        return {
+          pendingQuestionsByConv: {
+            ...s.pendingQuestionsByConv,
+            [req.conversationId]: next,
+          },
+        };
+      });
+      return;
+    }
+    case 'agent_state': {
+      const entry: AgentStateEntry = {
+        id: ev.agentId ?? ev.agentName,
+        conversationId: ev.conversationId,
+        agentId: ev.agentId,
+        agentName: ev.agentName,
+        msgId: ev.msgId,
+        state: ev.state,
+        reason: ev.reason,
+        updatedAt: ev.updatedAt,
+      };
+      set((s) => {
+        const prev = s.agentStatesByConv[entry.conversationId] ?? [];
+        const existing = prev.findIndex((item) => item.id === entry.id);
+        const next =
+          existing >= 0
+            ? prev.map((item, index) => (index === existing ? { ...item, ...entry } : item))
+            : [...prev, entry].slice(-100);
+        return {
+          agentStatesByConv: {
+            ...s.agentStatesByConv,
+            [entry.conversationId]: next,
+          },
+        };
+      });
+      if (ev.msgId) {
+        patchMsg(set, get, ev.msgId, () => ({
+          lastEventAt: ev.updatedAt,
+          lastAgentState: ev.state,
+          lastAgentStateReason: ev.reason,
+        }));
+      }
+      return;
+    }
     case 'msg_started': {
       const senderId = ev.message.senderId;
       const profile = lookupAgentProfile(senderId, get().agents);
@@ -832,6 +998,10 @@ function handleServerEvent(
         text: '',
         thinking: '',
         streaming: true,
+        startedAt: ev.message.createdAt,
+        lastEventAt: ev.message.createdAt,
+        tokenChars: 0,
+        thinkingChars: 0,
         createdAt: ev.message.createdAt,
       };
       set((s) => ({
@@ -851,11 +1021,22 @@ function handleServerEvent(
     case 'msg_done':
       // Drain any buffered tokens first so the final state is exact.
       flushPendingTokens(set, get);
-      patchMsg(set, get, ev.msgId, () => ({ streaming: false }));
+      patchMsg(set, get, ev.msgId, () => ({
+        streaming: false,
+        finishedAt: new Date().toISOString(),
+        lastEventAt: new Date().toISOString(),
+        lastAgentState: 'idle',
+      }));
       return;
     case 'msg_error':
       patchMsg(set, get, ev.msgId, (m) => ({
         streaming: false,
+        finishedAt: new Date().toISOString(),
+        lastEventAt: new Date().toISOString(),
+        lastActivityStatus: 'failed',
+        lastActivityTitle: `${ev.error.code}: ${ev.error.message}`,
+        lastAgentState: 'failed',
+        lastAgentStateReason: ev.error.message,
         text: (m.text || '') + `\n\n[error: ${ev.error.code} — ${ev.error.message}]`,
       }));
       return;
@@ -911,6 +1092,43 @@ function handleServerEvent(
         deploymentsByConv: { ...s.deploymentsByConv, [convId]: next },
         rightPanelTab:
           existing < 0 && get().activeId === convId ? 'deploy' : s.rightPanelTab,
+      }));
+      return;
+    }
+    case 'agent_activity': {
+      const entry: AgentActivityEntry = {
+        id: ev.activityId,
+        conversationId: ev.conversationId,
+        msgId: ev.msgId,
+        agentId: ev.agentId,
+        agentName: ev.agentName,
+        kind: ev.kind,
+        toolName: ev.toolName,
+        status: ev.status,
+        title: ev.title,
+        detail: ev.detail,
+        createdAt: ev.createdAt,
+      };
+      set((s) => {
+        const prev = s.agentActivityByConv[entry.conversationId] ?? [];
+        const existing = prev.findIndex((item) => item.id === entry.id);
+        const next =
+          existing >= 0
+            ? prev.map((item, index) => (index === existing ? { ...item, ...entry } : item))
+            : [...prev, entry].slice(-300);
+        return {
+          agentActivityByConv: {
+            ...s.agentActivityByConv,
+            [entry.conversationId]: next,
+          },
+        };
+      });
+      patchMsg(set, get, ev.msgId, () => ({
+        lastEventAt: ev.createdAt,
+        lastActivityTitle: ev.title,
+        lastActivityDetail: ev.detail,
+        lastActivityKind: ev.kind,
+        lastActivityStatus: ev.status,
       }));
       return;
     }

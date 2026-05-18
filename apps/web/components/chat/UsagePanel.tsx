@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo } from 'react';
 import { Coins, RefreshCw } from 'lucide-react';
 import { useConversationStore, prettyAgentName, roleColorFor } from '@/lib/store';
 import { AgentAvatar } from '../AgentAvatar';
@@ -22,8 +22,6 @@ export function UsagePanel() {
   const usage = useConversationStore((s) => (s.activeId ? s.usageByConv[s.activeId] : undefined));
   const fetchUsage = useConversationStore((s) => s.fetchUsage);
 
-  const [adapterFilter, setAdapterFilter] = useState<string>('all');
-
   useEffect(() => {
     if (!activeId) return;
     void fetchUsage(activeId);
@@ -31,17 +29,7 @@ export function UsagePanel() {
     return () => clearInterval(t);
   }, [activeId, fetchUsage]);
 
-  const adapters = useMemo(
-    () => Array.from(new Set((usage?.byModel ?? []).map((m) => m.adapterId))),
-    [usage],
-  );
-  const rows = useMemo(
-    () =>
-      (usage?.byModel ?? []).filter(
-        (m) => adapterFilter === 'all' || m.adapterId === adapterFilter,
-      ),
-    [usage, adapterFilter],
-  );
+  const rows = useMemo(() => usage?.byModel ?? [], [usage]);
   const filteredTotals = useMemo(
     () =>
       rows.reduce(
@@ -90,23 +78,6 @@ export function UsagePanel() {
             <Stat label="总 Token" value={fmtTokens(filteredTotals.totalTokens)} />
             <Stat label="调用次数" value={String(filteredTotals.calls)} />
           </div>
-
-          {adapters.length > 1 ? (
-            <div className="flex flex-wrap gap-1">
-              <FilterChip active={adapterFilter === 'all'} onClick={() => setAdapterFilter('all')}>
-                全部
-              </FilterChip>
-              {adapters.map((a) => (
-                <FilterChip
-                  key={a}
-                  active={adapterFilter === a}
-                  onClick={() => setAdapterFilter(a)}
-                >
-                  {a}
-                </FilterChip>
-              ))}
-            </div>
-          ) : null}
 
           <div className="space-y-1">
             {rows.map((m) => (
@@ -159,27 +130,5 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
       </div>
       <div className="mt-0.5 text-[10px] text-text-muted">{label}</div>
     </div>
-  );
-}
-
-function FilterChip({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={
-        'rounded px-2 py-0.5 text-[10px] ' +
-        (active ? 'bg-accent/20 text-accent' : 'bg-white/5 text-text-muted hover:text-text')
-      }
-    >
-      {children}
-    </button>
   );
 }

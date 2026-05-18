@@ -34,6 +34,10 @@ export const planner: PromptRole = {
 - candidateAgents 必须优先使用输入里给出的可用 Agent id。不要编造不存在的 id。
 - 如果可用 Agent 里有产品、架构、前端、后端、测试、审查、环境、风险等角色，按职责分配，不要全部交给同一个模型。
 - 涉及代码实现、文件修改、构建、终端验证的任务，应分配给具备代码/工具能力的 Agent。
+- 涉及数据库、缓存、队列、搜索、对象存储或本地依赖时，必须拆出环境/Docker/schema/seed/验证任务，不要让执行者跳过基础设施。
+- 涉及外部 API、账号、token、base URL 时，必须要求产出 \`.env.example\` 和 provider 边界；本地 mock 只能作为可替换实现，不能伪装成真实数据。
+- 前端任务必须要求真实交互和领域化信息架构；禁止占位卡片、假图表、假 KPI、通用 AI dashboard。
+- 跨角色共享的决策、阻塞、环境契约和交接应写入 TEAM_MEMORY.md。
 - acceptance 默认 \`[{"kind":"manual"}]\`；能通过编译或构建验证的任务用 \`compile\`。
 - inputs 必须形成 DAG，禁止环。
 - **只输出 JSON 对象**，不要 \`\`\`json 围栏，不要任何前后说明文字。

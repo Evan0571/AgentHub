@@ -1,6 +1,6 @@
 'use client';
 
-import { Coins, Folder, GitBranch, Monitor, Rocket } from 'lucide-react';
+import { Activity, Coins, Folder, GitBranch, Monitor, Rocket, ShieldAlert, UsersRound } from 'lucide-react';
 import clsx from 'clsx';
 import { useConversationStore } from '@/lib/store';
 import { PlanCard } from './PlanCard';
@@ -8,6 +8,9 @@ import { PreviewPanel } from './PreviewPanel';
 import { DeployPanel } from './DeployPanel';
 import { WorkspacePanel } from './WorkspacePanel';
 import { UsagePanel } from './UsagePanel';
+import { AgentActivityPanel } from './AgentActivityPanel';
+import { TeamPanel } from './TeamPanel';
+import { PermissionPanel } from './PermissionPanel';
 
 export function RightPanel() {
   const tab = useConversationStore((s) => s.rightPanelTab);
@@ -16,12 +19,39 @@ export function RightPanel() {
   const plan = useConversationStore((s) =>
     s.activeId ? s.plansByConv[s.activeId] : undefined,
   );
+  const activityCount = useConversationStore((s) =>
+    s.activeId
+      ? (s.agentActivityByConv[s.activeId] ?? []).filter((item) => item.status === 'running').length
+      : 0,
+  );
 
   return (
     <aside className="hidden w-96 flex-col border-l border-white/5 bg-bg-soft lg:flex">
-      <nav className="flex gap-1 border-b border-white/5 px-2 py-2">
+      <nav className="flex gap-1 overflow-x-auto border-b border-white/5 px-2 py-2">
         <TabBtn icon={<Folder className="h-4 w-4" />} active={tab === 'workspace'} onClick={() => setTab('workspace')}>
           Workspace
+        </TabBtn>
+        <TabBtn
+          icon={<UsersRound className="h-4 w-4" />}
+          active={tab === 'team'}
+          onClick={() => setTab('team')}
+        >
+          Team
+        </TabBtn>
+        <TabBtn
+          icon={<Activity className="h-4 w-4" />}
+          active={tab === 'activity'}
+          onClick={() => setTab('activity')}
+          badge={activityCount || undefined}
+        >
+          Activity
+        </TabBtn>
+        <TabBtn
+          icon={<ShieldAlert className="h-4 w-4" />}
+          active={tab === 'permissions'}
+          onClick={() => setTab('permissions')}
+        >
+          Permissions
         </TabBtn>
         <TabBtn
           icon={<GitBranch className="h-4 w-4" />}
@@ -44,6 +74,9 @@ export function RightPanel() {
 
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-4 text-sm">
         {tab === 'workspace' && <WorkspacePanel />}
+        {tab === 'team' && <TeamPanel />}
+        {tab === 'activity' && <AgentActivityPanel />}
+        {tab === 'permissions' && <PermissionPanel />}
         {tab === 'plan' &&
           (plan ? (
             <PlanCard plan={plan} />
@@ -81,7 +114,7 @@ function TabBtn({
     <button
       onClick={onClick}
       className={clsx(
-        'flex items-center gap-1.5 rounded px-3 py-1.5 text-xs',
+        'flex shrink-0 items-center gap-1.5 rounded px-3 py-1.5 text-xs',
         active ? 'bg-white/10 text-text' : 'text-text-muted hover:bg-white/5',
       )}
     >

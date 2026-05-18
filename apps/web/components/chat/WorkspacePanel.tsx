@@ -1,9 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { File, Folder, Play, RefreshCw, Save, TerminalSquare } from 'lucide-react';
+import { Play, RefreshCw, Save, TerminalSquare } from 'lucide-react';
 import clsx from 'clsx';
 import { useConversationStore } from '@/lib/store';
+import { FileGlyph } from './FileGlyph';
 
 interface WorkspaceFileEntry {
   path: string;
@@ -191,15 +192,15 @@ export function WorkspacePanel() {
                 disabled={entry.type === 'directory'}
                 onClick={() => void openFile(entry.path)}
                 className={clsx(
-                  'flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs',
+                  'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12.5px] font-medium transition',
                   selectedPath === entry.path
-                    ? 'bg-accent/20 text-text'
-                    : 'text-text-muted hover:bg-white/5 hover:text-text',
+                    ? 'bg-accent/15 text-text ring-1 ring-accent/25'
+                    : 'text-text/85 hover:bg-white/5 hover:text-text',
                   entry.type === 'directory' && 'cursor-default hover:bg-transparent',
                 )}
               >
-                {entry.type === 'directory' ? <Folder className="h-3.5 w-3.5" /> : <File className="h-3.5 w-3.5" />}
-                <span className="min-w-0 flex-1 truncate font-mono">{entry.path}</span>
+                <FileGlyph name={entry.path.split('/').pop() ?? entry.path} type={entry.type} />
+                <span className="min-w-0 flex-1 truncate">{entry.path}</span>
                 {entry.type === 'file' ? (
                   <span className="text-[10px] text-text-muted/70">{formatBytes(entry.size ?? 0)}</span>
                 ) : null}
@@ -232,7 +233,7 @@ export function WorkspacePanel() {
             onChange={(e) => setDraft(selected.truncated ? draft : e.target.value)}
             readOnly={selected.truncated}
             spellCheck={false}
-            className="min-h-0 flex-1 resize-none overflow-auto bg-transparent p-3 font-mono text-[11px] leading-relaxed text-text outline-none"
+            className="min-h-0 flex-1 resize-none overflow-auto bg-transparent p-3 font-mono text-[11px] font-medium leading-relaxed text-text outline-none"
           />
         ) : (
           <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-text-muted">
@@ -267,7 +268,7 @@ export function WorkspacePanel() {
             </button>
           </div>
           {terminal ? (
-            <pre className="max-h-40 overflow-auto rounded bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-text-muted whitespace-pre-wrap">
+            <pre className="max-h-40 overflow-auto rounded bg-bg/75 p-2 font-mono text-[10px] leading-relaxed text-text-muted ring-1 ring-white/5 whitespace-pre-wrap">
               {`$ ${terminal.command}\nexit ${terminal.exitCode ?? 'null'}${terminal.timedOut ? ' (timeout)' : ''}\n\n`}
               {terminal.stdout}
               {terminal.stderr ? `\n[stderr]\n${terminal.stderr}` : ''}

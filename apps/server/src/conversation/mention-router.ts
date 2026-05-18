@@ -1,11 +1,20 @@
 import { Inject, Injectable } from '@nestjs/common';
 import type { AgentAdapter, AdapterRegistry, ChatRequest, ContentPart } from '@agenthub/adapter-core';
-import { type ClientEvent, type MessageAttachment, type MessageContent, type ServerEvent, PROJECT_PLANNER_MENTION } from '@agenthub/shared-types';
+import {
+  type ClientEvent,
+  type MessageAttachment,
+  type MessageContent,
+  type ServerEvent,
+  type UserQuestion,
+  type UserQuestionRequest,
+  PROJECT_PLANNER_MENTION,
+} from '@agenthub/shared-types';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
 import type { OrchestratorService } from '../orchestrator/orchestrator.service.js';
 import { PlannerService } from '../orchestrator/planner.service.js';
 import { PlanService } from '../orchestrator/plan.service.js';
+import { TeamWakeService } from '../orchestrator/team-wake.service.js';
 import { MessagesRepo } from '../db/messages.repo.js';
 import { AgentsRepo } from '../db/agents.repo.js';
 import { ConversationsRepo } from '../db/conversations.repo.js';
@@ -19,6 +28,12 @@ interface ResolvedAgent {
   adapterId: string;        // which adapter backs this agent
   name: string;             // display name shown in peer-aware prompt
   systemPrompt: string;     // custom role / system prompt on the agent itself
+}
+
+interface CoordinatorProgress {
+  msgId: string;
+  senderId: string;
+  senderType: 'agent' | 'system';
 }
 
 /**
@@ -54,12 +69,15 @@ const DEFAULT_SYSTEM_PROMPT = `你是 AgentHub 群聊中的助手。请遵守如
 - 不要使用 emoji，不要写 AI 助手式客套话。
 - 不要用"我将/首先/接下来/总结/如需请告知"作为段落模板。
 - 已经通过工具完成的事只报告结果和关键文件；不要把每一步工具调用复述进最终正文。
-- 遇到信息不足时，先基于项目名称、附件、工作区文件做合理假设并推进；只有真正阻断执行时才问用户。
+- 遇到信息不足但不影响方向时，基于项目名称、附件、工作区文件做合理假设并推进。
+- 如果缺失信息会改变产品形态、数据/合规边界、部署成本、外部凭据或用户预期粒度，必须先问用户 2-4 个具体问题或给出选项，不要硬猜。
 
 ## 团队协作准则（所有角色都要遵守）
 - **不要急，允许多轮迭代**：完整项目不可能一次做完。先打通最小闭环，再分轮迭代增强；可以做"预处理/打地基"的过渡产出，不要假装一步到位。
 - **互相沟通**：你的改动如果会影响别人的产物（改了接口契约、文件结构、数据模型、共享类型等），必须在回复里 @ 受影响的角色，让他们对齐，并简述改了什么、为什么。
 - **遇到不确定先推进**：需求模糊但不阻断时，写下合理假设并继续推进；只有代价大且无法判断时才 @ 用户确认。
+- **共享记忆**：PROJECT.md 是项目锚点，TEAM_MEMORY.md 是团队共享记忆。改了环境变量、Docker、接口、数据模型、验收标准或跨角色交接时，把简短结论写入 TEAM_MEMORY.md。
+- **禁止空壳交付**：前端不能只有占位卡片/假图表/假 KPI；后端不能只有假接口；需要用户配置的 key/token/URL 要写入 .env.example 并说明用途。
 - **禁止占用 3000 / 4000 端口**（用户本机的开发服务正在用）。需要本地起服务一律换 5173 / 8080 等其它端口；优先用 \`npm run build\` / \`tsc\` 这类会退出的命令验证，不要长跑 dev server（\`npm run start\` / \`vite\` 常驻进程）。`;
 
 @Injectable()
@@ -76,6 +94,7 @@ export class MentionRouter {
     private readonly planner: PlannerService,
     private readonly projectState: ProjectStateService,
     private readonly plans: PlanService,
+    private readonly teamWake: TeamWakeService,
   ) {}
 
   async route(
@@ -121,12 +140,42 @@ export class MentionRouter {
       // The whole 组长 path is guarded: triage / plan can throw or time out,
       // but a group message must NEVER get a silent non-reply — always leave
       // at least one visible 组长 message in the chat.
+      const routing = await this.startCoordinatorProgress(event.conversationId, send);
       try {
         const triage = await this.planner.triage({
           conversationId: event.conversationId,
           text: rawText,
           recentContext,
         });
+
+        if (triage.mode === 'clarify') {
+          await this.finishCoordinatorProgress(
+            event.conversationId,
+            routing,
+            '需要你先确认几个关键选择；下面的问题会直接决定任务拆分和交付标准。',
+            send,
+          );
+          const questionRequest = buildQuestionRequest({
+            conversationId: event.conversationId,
+            sourceAgentId: routing.senderType === 'agent' ? routing.senderId : undefined,
+            sourceAgentName: '项目组长',
+            reason: triage.brief,
+            questions: triage.questions,
+            originalGoal: goal,
+          });
+          send({
+            op: 'agent_state',
+            conversationId: event.conversationId,
+            agentId: questionRequest.sourceAgentId,
+            agentName: questionRequest.sourceAgentName,
+            msgId: routing.msgId,
+            state: 'waiting_user',
+            reason: '等待你回答澄清问题后继续规划',
+            updatedAt: new Date().toISOString(),
+          });
+          send({ op: 'ask_user_question', request: questionRequest });
+          return;
+        }
 
         if (triage.mode === 'dispatch' && triage.targets.length > 0) {
           await this.tracing.runWithTrace(
@@ -135,23 +184,25 @@ export class MentionRouter {
               sessionId: event.conversationId,
               metadata: { conversationId: event.conversationId, targets: triage.targets },
             },
-            () => this.dispatchDirectly(event, triage.targets, triage.brief, send),
+            () => this.dispatchDirectly(event, triage.targets, triage.brief, send, routing),
           );
           return;
         }
 
         // plan mode: 组长 narrates the hand-off, then the architect produces a
         // real Plan DAG (orchestrator.plan resolves the architect as planner).
-        await this.emitCoordinatorNote(
+        await this.finishCoordinatorProgress(
           event.conversationId,
+          routing,
           `进入项目执行规划：先生成任务 DAG，再按角色推进。`,
           send,
         );
         await orchestrator.plan({ conversationId: event.conversationId, rootGoal: goal }, send);
       } catch (e) {
         console.error('[mention-router] 组长 path failed:', e);
-        await this.emitCoordinatorNote(
+        await this.finishCoordinatorProgress(
           event.conversationId,
+          routing,
           `组长处理失败：${(e as Error).message || '未知错误'}。\n可以重发，或查看 server 控制台日志。`,
           send,
         ).catch(() => undefined);
@@ -188,6 +239,7 @@ export class MentionRouter {
     const realConvId = this.messages.resolveConversationUuid(event.conversationId);
     const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
     const groupRules = conv?.groupSystemPrompt ?? null;
+    const teamRoster = renderTeamRoster(conv?.members ?? []);
     const userContent = await this.contentToAdapterContent(event.conversationId, event.content);
     const recentContext = await this.buildRecentContext(event.conversationId, 10);
 
@@ -197,6 +249,7 @@ export class MentionRouter {
           self,
           peers,
           groupRules,
+          teamRoster,
           conversationId: event.conversationId,
           userContent,
           recentContext,
@@ -217,38 +270,47 @@ export class MentionRouter {
     targetIds: string[],
     brief: string,
     send: (e: ServerEvent) => void,
+    handoff?: CoordinatorProgress,
   ): Promise<void> {
     const resolved = (
       await Promise.all(targetIds.map((id) => this.resolveAgent(id)))
     ).filter((r): r is ResolvedAgent => r !== null);
-    if (resolved.length === 0) return;
+    if (resolved.length === 0) {
+      if (handoff) {
+        await this.finishCoordinatorProgress(event.conversationId, handoff, '没有解析到可用成员，派单停止。', send);
+      }
+      return;
+    }
 
     const realConvId = this.messages.resolveConversationUuid(event.conversationId);
     const conv = realConvId ? await this.convsRepo.getById(realConvId) : null;
     const groupRules = conv?.groupSystemPrompt ?? null;
+    const teamRoster = renderTeamRoster(conv?.members ?? []);
 
     // 组长 hand-off note (so the chat shows the routing decision).
     const leadId = (await this.resolveCoordinatorSpeaker(event.conversationId)) ?? 'system';
-    const noteId = cryptoRandomId();
+    const noteId = handoff?.msgId ?? cryptoRandomId();
     const names = resolved.map((r) => r.name).join('、');
-    send({
-      op: 'msg_started',
-      message: {
-        id: noteId,
-        conversationId: event.conversationId,
-        senderType: leadId === 'system' ? 'system' : 'agent',
-        senderId: leadId,
-        createdAt: new Date().toISOString(),
-      },
-    });
+    if (!handoff) {
+      send({
+        op: 'msg_started',
+        message: {
+          id: noteId,
+          conversationId: event.conversationId,
+          senderType: leadId === 'system' ? 'system' : 'agent',
+          senderId: leadId,
+          createdAt: new Date().toISOString(),
+        },
+      });
+    }
     const note = `派单给 **${names}**：\n\n> ${brief}`;
     send({ op: 'msg_token', msgId: noteId, delta: note });
     send({ op: 'msg_done', msgId: noteId });
     void this.messages
       .insert({
         conversationSlug: event.conversationId,
-        senderType: leadId === 'system' ? 'system' : 'agent',
-        senderId: leadId,
+        senderType: handoff?.senderType ?? (leadId === 'system' ? 'system' : 'agent'),
+        senderId: handoff?.senderId ?? leadId,
         text: note,
       })
       .catch(() => undefined);
@@ -268,6 +330,7 @@ export class MentionRouter {
           self,
           peers: resolved,
           groupRules,
+          teamRoster,
           conversationId: event.conversationId,
           userContent,
           recentContext,
@@ -276,6 +339,52 @@ export class MentionRouter {
         }),
       ),
     );
+  }
+
+  private async startCoordinatorProgress(
+    conversationId: string,
+    send: (e: ServerEvent) => void,
+  ): Promise<CoordinatorProgress> {
+    const leadId = (await this.resolveCoordinatorSpeaker(conversationId)) ?? 'system';
+    const progress: CoordinatorProgress = {
+      msgId: cryptoRandomId(),
+      senderId: leadId,
+      senderType: leadId === 'system' ? 'system' : 'agent',
+    };
+    send({
+      op: 'msg_started',
+      message: {
+        id: progress.msgId,
+        conversationId,
+        senderType: progress.senderType,
+        senderId: progress.senderId,
+        createdAt: new Date().toISOString(),
+      },
+    });
+    send({
+      op: 'msg_thinking',
+      msgId: progress.msgId,
+      delta: '接收用户消息，正在判断是直接派单、生成 Plan，还是先向用户澄清关键选择。\n',
+    });
+    return progress;
+  }
+
+  private async finishCoordinatorProgress(
+    conversationId: string,
+    progress: CoordinatorProgress,
+    text: string,
+    send: (e: ServerEvent) => void,
+  ): Promise<void> {
+    send({ op: 'msg_token', msgId: progress.msgId, delta: text });
+    send({ op: 'msg_done', msgId: progress.msgId });
+    void this.messages
+      .insert({
+        conversationSlug: conversationId,
+        senderType: progress.senderType,
+        senderId: progress.senderId,
+        text,
+      })
+      .catch(() => undefined);
   }
 
   /** Resolve the conversation's architect agentId for the hand-off speaker. */
@@ -419,11 +528,15 @@ export class MentionRouter {
     self: ResolvedAgent,
     peers: ResolvedAgent[],
     groupRules: string | null,
+    teamRoster?: string,
     recentContext?: string,
   ): string {
     const blocks: string[] = [DEFAULT_SYSTEM_PROMPT];
     if (groupRules && groupRules.trim()) {
       blocks.push(`## 群规则\n\n${groupRules.trim()}`);
+    }
+    if (teamRoster && teamRoster.trim()) {
+      blocks.push(`## 团队名册与交接规则\n\n${teamRoster.trim()}`);
     }
     if (self.systemPrompt && self.systemPrompt.trim()) {
       blocks.push(`## 你的角色：${self.name}\n\n${self.systemPrompt.trim()}`);
@@ -455,6 +568,7 @@ export class MentionRouter {
     self: ResolvedAgent;
     peers: ResolvedAgent[];
     groupRules: string | null;
+    teamRoster?: string;
     conversationId: string;
     userContent: string | ContentPart[];
     recentContext?: string;
@@ -485,7 +599,13 @@ export class MentionRouter {
     const msgId = cryptoRandomId();
     const req: ChatRequest = {
       taskId: msgId,
-      systemPrompt: this.buildSystemPrompt(args.self, args.peers, args.groupRules, args.recentContext),
+      systemPrompt: this.buildSystemPrompt(
+        args.self,
+        args.peers,
+        args.groupRules,
+        args.teamRoster,
+        args.recentContext,
+      ),
       messages: [{ role: 'user', content: args.userContent }],
       workspace: {
         id: args.conversationId,
@@ -530,6 +650,10 @@ export class MentionRouter {
         })
         .catch((e) => console.warn('[mention-router] persist agent msg failed', e));
     }
+
+    await this.teamWake.processPending(args.conversationId, args.send, {
+      reason: `directed handoff after ${args.self.name}`,
+    });
   }
 
   private async contentToAdapterContent(conversationId: string, content: MessageContent): Promise<string | ContentPart[]> {
@@ -603,6 +727,55 @@ export class MentionRouter {
   }
 }
 
+function buildQuestionRequest(input: {
+  conversationId: string;
+  sourceAgentId?: string;
+  sourceAgentName: string;
+  reason: string;
+  questions?: UserQuestion[];
+  originalGoal: string;
+}): UserQuestionRequest {
+  const questions =
+    input.questions && input.questions.length > 0
+      ? input.questions
+      : [
+          {
+            id: 'scope',
+            header: '粒度',
+            question: '这次先按什么交付粒度推进？',
+            options: [
+              {
+                id: 'mvp',
+                label: '本地 MVP',
+                description: '先打通真实可运行的最小闭环，后续再增强。',
+                recommended: true,
+              },
+              {
+                id: 'full',
+                label: '完整骨架',
+                description: '一次性搭出更完整的功能骨架，但验证范围会更大。',
+              },
+              {
+                id: 'design',
+                label: '先定方案',
+                description: '先沉淀产品/架构方案，再进入实现。',
+              },
+            ],
+          },
+        ];
+  return {
+    id: cryptoRandomId(),
+    conversationId: input.conversationId,
+    sourceAgentId: input.sourceAgentId,
+    sourceAgentName: input.sourceAgentName,
+    title: '需要确认关键选择',
+    reason: input.reason,
+    questions,
+    resumePrompt: `原始目标：\n${input.originalGoal}`,
+    createdAt: new Date().toISOString(),
+  };
+}
+
 /**
  * Clean, human-readable goal for the Plan panel + chat echo. Attachments are
  * summarized in one short line (count only) — the executing agents still get
@@ -630,4 +803,38 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 102.4) / 10} KB`;
   return `${Math.round(bytes / 1024 / 102.4) / 10} MB`;
+}
+
+function renderTeamRoster(
+  members: Array<{
+    agentId: string;
+    name: string;
+    adapterId: string;
+    systemPrompt?: string | null;
+  }>,
+): string {
+  const visible = members.filter((m) => m.agentId !== 'orchestrator' && m.agentId !== 'mock');
+  if (visible.length === 0) return '';
+  const lines = visible.map((member) => {
+    const role = summarizeRole(member.systemPrompt) || member.adapterId;
+    return `- ${member.name} (@${shortAgentId(member.agentId)}): ${role}`;
+  });
+  return [
+    lines.join('\n'),
+    '',
+    '协作规则：把共享接口、文件结构、验证命令、环境变量、Docker 服务和阻塞物写清楚；持久结论写入 TEAM_MEMORY.md；如果改动会影响别人，点名相关角色并给出交接说明；不要替其他成员产出正文。',
+  ].join('\n');
+}
+
+function summarizeRole(systemPrompt: string | null | undefined): string {
+  if (!systemPrompt) return '';
+  return systemPrompt
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
+function shortAgentId(agentId: string): string {
+  const match = /^conv-agent-[0-9a-fA-F-]{36}-(.+)$/.exec(agentId);
+  return match?.[1] ?? agentId;
 }

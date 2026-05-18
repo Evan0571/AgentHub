@@ -326,6 +326,7 @@ function renderTasksMarkdown(
     '- 右侧 Plan 面板是执行用 DAG；这个文件是可编辑的项目任务说明。',
     '- 如果你想改任务范围，先改这里，再在 Plan 面板同步增删/修改任务。',
     '- 每个 Agent 执行任务时应优先参考本文件和 workspace 里的真实文件。',
+    '- 跨角色共享的决策、环境变量、Docker 服务、接口契约和阻塞问题写入 TEAM_MEMORY.md。',
     '',
     '## Root Goal',
     '',

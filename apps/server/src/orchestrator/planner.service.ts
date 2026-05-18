@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { AdapterRegistry, AgentAdapter, ChatRequest } from '@agenthub/adapter-core';
-import type { Plan, PlanTask, AcceptanceRule } from '@agenthub/shared-types';
+import type { Plan, PlanTask, AcceptanceRule, UserQuestion } from '@agenthub/shared-types';
 import { planner as plannerPrompt } from '@agenthub/prompts';
 import { ADAPTER_REGISTRY } from '../adapter/adapter.module.js';
 import { AdapterFactoryService } from '../adapter/adapter.factory.js';
@@ -35,6 +35,13 @@ interface ResolvedPlannerAgent extends PlannerAgentProfile {
   adapter: AgentAdapter;
 }
 
+type TriageResult = {
+  mode: 'plan' | 'dispatch' | 'clarify';
+  targets: string[];
+  brief: string;
+  questions?: UserQuestion[];
+};
+
 @Injectable()
 export class PlannerService {
   constructor(
@@ -67,6 +74,11 @@ export class PlannerService {
       `- 拆解必须围绕项目名称和根目标里的真实领域展开；不要把项目写成"登录 + 数据展示"这种通用模板。\n` +
       `- 任务要**针对这个具体项目**拆解（用到项目里的真实功能/模块名），不要输出"定义产品目标""设计文件结构"这种放之四海皆准的空壳。\n` +
       `- 先 MVP 再扩展：第一批任务交付一个能跑起来的最小闭环，后续任务再加增强功能，不要一个任务想做完所有事。\n` +
+      `- 如果目标存在会改变架构或产品形态的关键歧义，规划里必须先设置“需求澄清/用户选择”任务，不要替用户决定高代价方向。\n` +
+      `- 不允许占位符式交付：每个可见页面、按钮、表格、图表都必须有真实本地状态/数据流/错误态；确实依赖外部服务的能力要通过 provider 接口隔离，并写清 .env.example。\n` +
+      `- 涉及数据库、队列、缓存、搜索、对象存储或本地依赖时，任务必须包含 docker-compose、schema/migration、seed 或等价可运行配置，并要求执行者用 terminal_run 验证配置。\n` +
+      `- 涉及情报/风控/黑灰产分析这类具体领域时，任务必须包含真实领域闭环：数据源配置、实体/事件抽取、证据字段、时间线、风险评分、筛选搜索、报告导出或告警流；不要做通用 AI dashboard。\n` +
+      `- 前端任务必须交付领域化、可操作、克制且专业的界面；禁止蓝紫渐变 AI 模板、空卡片、假图表、假 KPI。\n` +
       `- **全员覆盖**：上面列出的每一个 agent（组长 team-lead 除外）都必须**至少被分配到 1 个任务**（写进它的 candidateAgents）。不要让任何成员闲置——前端/后端/测试/审查/环境/产品/资深用户/风险审视都要有活干，必要时为某个角色单开一个任务（如测试员→写并跑测试，风险审视员→安全/边界审查，资深用户→可用性走查）。\n` +
       `- **允许迭代**：这个项目通常一轮做不完。可以规划"第一轮 MVP → 验证 → 第二轮增强 → 再验证"这样的多阶段任务（用 inputs 表达依赖），不要假设一次就交付完整成品。\n` +
       `- 每个任务的 candidateAgents 必须来自上面的 id 列表。\n` +
@@ -120,13 +132,15 @@ export class PlannerService {
    *   - 'plan'     : a whole project / large change → decompose into a DAG.
    *   - 'dispatch' : a small/scoped change → hand straight to specific
    *                  engineers (targets = conversation member agentIds).
+   *   - 'clarify'  : high-impact ambiguity → ask the user concrete questions
+   *                  before planning or implementation.
    * Fail-open to 'plan' so a triage hiccup never silently drops the request.
    */
   async triage(input: {
     conversationId: string;
     text: string;
     recentContext: string;
-  }): Promise<{ mode: 'plan' | 'dispatch'; targets: string[]; brief: string }> {
+  }): Promise<TriageResult> {
     const fallback = { mode: 'plan' as const, targets: [] as string[], brief: input.text };
     const catalog = await this.agentCatalog(input.conversationId);
     const memberIds = [...catalog.ids].filter((id) => id !== 'orchestrator' && id !== 'mock');
@@ -144,11 +158,18 @@ export class PlannerService {
       `判定规则：\n` +
       `- 如果最近已经在同一个项目/Plan 上推进，用户说"继续、按你的理解写、修正、补充、哪里没做完、这不相关"之类跟进话，不要重新 plan；mode="dispatch"，交给上一个相关角色。\n` +
       `- 用户问"还有任务没做完吗/现在进度怎样/剩哪些任务"属于状态查询，不要重新 plan；选项目组长或架构师做简短状态回复。\n` +
+      `- 如果缺少会显著改变产物的关键信息，mode="clarify"。典型场景：目标用户/使用场景不清、MVP 粒度不清、数据源/API key/账号权限未给、数据库/部署方案会影响架构、涉及合规/安全边界、UI 风格或业务闭环有多种合理方向。\n` +
+      `- clarify 的 brief 必须是直接发给用户的中文提问，包含 2-4 个编号问题或选项；每个问题要能让团队立刻继续规划，不要问"是否继续"这种空问题。\n` +
+      `- 如果可以先做低风险的本地最小闭环，同时把外部配置留给 .env.example，不要 clarify；继续 plan 或 dispatch，并在 brief 里要求执行者写清配置项。\n` +
       `- 用户要"做一个完整项目 / 从零搭建 / 全栈 / 大重构 / 多模块" → mode="plan"。\n` +
       `- 用户是"小改动 / 修个 bug / 加个按钮 / 调样式 / 解释 / 跑个命令 / 端口冲突"等 → mode="dispatch"，并从下面成员里选 1-3 个最合适的 agentId 放进 targets，brief 写清楚要他们做什么。\n` +
-      `- 不确定时倾向 dispatch（更轻、更快），除非明显是大项目。\n\n` +
+      `- 不确定时：如果不确定只影响实现细节，倾向 dispatch；如果不确定会影响产品形态、数据/合规/成本，倾向 clarify。\n\n` +
       `可选成员（targets 只能从这些 id 选）：\n${catalog.text}\n\n` +
-      `输出格式：{"mode":"plan"|"dispatch","targets":["<agentId>"],"brief":"<给执行者的一句话指令>"}`;
+      `输出格式：{"mode":"plan"|"dispatch"|"clarify","targets":["<agentId>"],"brief":"<给执行者的一句话指令或给用户的澄清问题>"}`;
+
+    const triageSystemPrompt =
+      sys +
+      '\n\nclarify 时尽量附带 questions 数组：1-4 个问题，每个问题包含 id/header/question/options/multiSelect；options 为 2-4 个选项，包含 id/label/description/recommended。不要加入 Other 选项，前端会自动提供。';
 
     const userMsg =
       (input.recentContext ? `最近对话（供判断上下文）：\n${input.recentContext}\n\n` : '') +
@@ -161,9 +182,9 @@ export class PlannerService {
       const req: ChatRequest = {
         taskId: 'triage-' + Date.now(),
         metadata: { purpose: 'triage', conversationId: input.conversationId },
-        systemPrompt: sys,
+        systemPrompt: triageSystemPrompt,
         messages: [{ role: 'user', content: userMsg }],
-        budget: { maxTokens: 400 },
+        budget: { maxTokens: 800 },
       };
       for await (const ev of adapter.chat(req, ctrl.signal)) {
         if (ev.type === 'token') raw += ev.text;
@@ -176,14 +197,23 @@ export class PlannerService {
     }
 
     const parsed = extractJson(raw) as
-      | { mode?: unknown; targets?: unknown; brief?: unknown }
+      | { mode?: unknown; targets?: unknown; brief?: unknown; questions?: unknown }
       | null;
     if (!parsed) return fallback;
-    const mode = parsed.mode === 'dispatch' ? 'dispatch' : 'plan';
+    const mode =
+      parsed.mode === 'dispatch' ? 'dispatch' : parsed.mode === 'clarify' ? 'clarify' : 'plan';
     const targets = Array.isArray(parsed.targets)
       ? parsed.targets.filter((t): t is string => typeof t === 'string' && memberIds.includes(t))
       : [];
     const brief = typeof parsed.brief === 'string' && parsed.brief.trim() ? parsed.brief.trim() : input.text;
+    if (mode === 'clarify') {
+      return {
+        mode,
+        targets: [],
+        brief,
+        questions: normalizeClarifyQuestions(parsed.questions, brief),
+      };
+    }
     // dispatch with no valid target is useless → fall back to planning.
     if (mode === 'dispatch' && targets.length === 0) return fallback;
     return { mode, targets, brief };
@@ -526,6 +556,109 @@ function pickDefault(registry: AdapterRegistry): string | undefined {
     if (registry.has(id)) return id;
   }
   return undefined;
+}
+
+function normalizeClarifyQuestions(raw: unknown, brief: string): UserQuestion[] {
+  if (!Array.isArray(raw)) return fallbackClarifyQuestions(brief);
+  const questions = raw
+    .slice(0, 4)
+    .map((item, index): UserQuestion | null => {
+      if (!item || typeof item !== 'object') return null;
+      const row = item as Record<string, unknown>;
+      const question = typeof row.question === 'string' ? row.question.trim() : '';
+      const optionsRaw = Array.isArray(row.options) ? row.options : [];
+      const options = optionsRaw
+        .slice(0, 4)
+        .map((option, optionIndex) => {
+          if (!option || typeof option !== 'object') return null;
+          const opt = option as Record<string, unknown>;
+          const label = typeof opt.label === 'string' ? opt.label.trim() : '';
+          if (!label) return null;
+          return {
+            id: typeof opt.id === 'string' && opt.id.trim() ? opt.id.trim() : `o-${index + 1}-${optionIndex + 1}`,
+            label,
+            description:
+              typeof opt.description === 'string' && opt.description.trim()
+                ? opt.description.trim()
+                : label,
+            recommended: opt.recommended === true || optionIndex === 0,
+            ...(typeof opt.preview === 'string' && opt.preview.trim() ? { preview: opt.preview.trim() } : {}),
+          };
+        })
+        .filter((option): option is NonNullable<typeof option> => option !== null);
+      if (!question || options.length < 2) return null;
+      return {
+        id: typeof row.id === 'string' && row.id.trim() ? row.id.trim() : `q-${index + 1}`,
+        header:
+          typeof row.header === 'string' && row.header.trim()
+            ? row.header.trim().slice(0, 12)
+            : `问题 ${index + 1}`,
+        question,
+        options,
+        ...(row.multiSelect === true ? { multiSelect: true } : {}),
+      };
+    })
+    .filter((question): question is UserQuestion => question !== null);
+  return questions.length > 0 ? questions : fallbackClarifyQuestions(brief);
+}
+
+function fallbackClarifyQuestions(brief: string): UserQuestion[] {
+  return [
+    {
+      id: 'scope',
+      header: '粒度',
+      question: extractFirstQuestion(brief) || '这次先按什么粒度推进？',
+      options: [
+        {
+          id: 'scope-mvp',
+          label: '本地 MVP',
+          description: '先打通真实可运行的最小闭环，后续再增强。',
+          recommended: true,
+        },
+        {
+          id: 'scope-full',
+          label: '完整骨架',
+          description: '一次性搭出更完整的功能骨架，但验证范围会变大。',
+        },
+        {
+          id: 'scope-design',
+          label: '先定方案',
+          description: '先沉淀产品/架构方案，再进入实现。',
+        },
+      ],
+    },
+    {
+      id: 'dependency',
+      header: '依赖',
+      question: '外部 API、数据库、搜索、队列或对象存储应该怎么处理？',
+      options: [
+        {
+          id: 'dep-local',
+          label: '本地可跑',
+          description: '先用本地 provider/mock 和 .env.example 隔离外部依赖。',
+          recommended: true,
+        },
+        {
+          id: 'dep-real',
+          label: '真实服务',
+          description: '我会提供真实 key、URL 或账号，直接按生产接入方式设计。',
+        },
+        {
+          id: 'dep-none',
+          label: '暂不接入',
+          description: '当前阶段不涉及外部依赖，只做本地功能闭环。',
+        },
+      ],
+    },
+  ];
+}
+
+function extractFirstQuestion(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*\d.、\s]+/, '').trim())
+    .filter(Boolean);
+  return lines.find((line) => /[？?]$/.test(line)) ?? '';
 }
 
 function deterministicTriage(

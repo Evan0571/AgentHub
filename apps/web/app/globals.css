@@ -13,7 +13,7 @@
   --bg-soft: 17 20 26;
   --bg-panel: 22 26 35;
   --text: 231 233 238;
-  --text-muted: 154 163 178;
+  --text-muted: 168 176 190;
   --accent: 20 184 166;
   --accent-hover: 45 212 191;
   color-scheme: dark;
@@ -24,7 +24,7 @@
   --bg-soft: 248 249 251;
   --bg-panel: 241 242 245;
   --text: 26 29 35;
-  --text-muted: 107 114 128;
+  --text-muted: 91 99 112;
   --accent: 15 118 110;
   --accent-hover: 17 94 89;
   color-scheme: light;
@@ -35,7 +35,16 @@ html, body, #__next {
 }
 
 body {
-  @apply bg-bg text-text font-sans antialiased;
+  @apply bg-bg text-text font-sans subpixel-antialiased;
+  font-weight: 500;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
 }
 
 /* thin scrollbar (webkit) */

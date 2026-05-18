@@ -7,7 +7,7 @@ import type {
   ToolCall,
   TokenUsage,
 } from '@agenthub/adapter-core';
-import type { ServerEvent } from '@agenthub/shared-types';
+import type { AgentRuntimeState, ServerEvent } from '@agenthub/shared-types';
 import { WorkspaceService } from './workspace.service.js';
 
 export interface AgentToolRunInput {
@@ -48,6 +48,7 @@ export class AgentToolRunnerService {
     const systemPrompt = appendWorkspaceInstructions(input.request.systemPrompt, input.adapter.capabilities.toolUse);
     let output = '';
     let finalUsage: TokenUsage | undefined;
+    sendAgentState(input, 'running', 'model stream started');
 
     for (let round = 0; round <= maxToolRounds; round++) {
       const toolCalls: ToolCall[] = [];
@@ -99,6 +100,11 @@ export class AgentToolRunnerService {
               break;
             case 'tool_call':
               toolCalls.push(event.call);
+              sendAgentActivity(input, event.call, {
+                status: 'running',
+                title: describeToolCall(event.call.name, event.call.args),
+                detail: describeToolArgs(event.call.name, event.call.args),
+              });
               input.send({
                 op: 'msg_thinking',
                 msgId: input.msgId,
@@ -110,6 +116,20 @@ export class AgentToolRunnerService {
               // outcome; skip the noisy raw mid-stream result blob.
               break;
             case 'file_patch':
+              input.send({
+                op: 'agent_activity',
+                activityId: `${input.msgId}:file_patch:${Date.now()}`,
+                conversationId: input.conversationId,
+                msgId: input.msgId,
+                agentId: requestAgentId(input.request),
+                agentName: requestAgentName(input.request),
+                kind: 'file',
+                toolName: 'file_patch',
+                status: 'succeeded',
+                title: `修改 ${event.path}`,
+                detail: event.path,
+                createdAt: new Date().toISOString(),
+              });
               input.send({
                 op: 'msg_thinking',
                 msgId: input.msgId,
@@ -138,6 +158,7 @@ export class AgentToolRunnerService {
             },
           });
           if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+          sendAgentState(input, 'blocked', `no stream events for ${Math.round(idleMs / 1000)}s`);
           return {
             output,
             errored: true,
@@ -158,6 +179,7 @@ export class AgentToolRunnerService {
           },
         });
         if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+        sendAgentState(input, 'failed', e instanceof Error ? e.message : String(e));
         return {
           output,
           errored: true,
@@ -171,10 +193,14 @@ export class AgentToolRunnerService {
         if (idleTimer) clearTimeout(idleTimer);
       }
 
-      if (roundErrored) return { output, errored: true, error: roundError };
+      if (roundErrored) {
+        sendAgentState(input, 'failed', roundError?.message ?? 'agent stream interrupted');
+        return { output, errored: true, error: roundError };
+      }
 
       if (toolCalls.length === 0) {
         if (!input.suppressDone) input.send({ op: 'msg_done', msgId: input.msgId, usage: finalUsage });
+        sendAgentState(input, 'idle', 'response complete');
         return { output, errored: false };
       }
 
@@ -188,6 +214,7 @@ export class AgentToolRunnerService {
             retryable: false,
           },
         });
+        sendAgentState(input, 'blocked', `tool round limit ${maxToolRounds} reached`);
         return { output, errored: true };
       }
 
@@ -198,7 +225,13 @@ export class AgentToolRunnerService {
       });
 
       for (const call of toolCalls) {
-        const result = await this.executeWorkspaceTool(input.conversationId, call);
+        const result = await this.executeWorkspaceTool(input, call);
+        const ok = (result as { ok?: boolean } | undefined)?.ok !== false;
+        sendAgentActivity(input, call, {
+          status: ok ? 'succeeded' : 'failed',
+          title: describeToolCall(call.name, call.args),
+          detail: describeToolDone(call.name, call.args, result),
+        });
         input.send({
           op: 'msg_thinking',
           msgId: input.msgId,
@@ -248,11 +281,11 @@ export class AgentToolRunnerService {
     return { output, errored: false };
   }
 
-  private async executeWorkspaceTool(conversationId: string, call: ToolCall): Promise<unknown> {
+  private async executeWorkspaceTool(input: AgentToolRunInput, call: ToolCall): Promise<unknown> {
     try {
       return {
         ok: true,
-        result: await this.workspace.executeTool(conversationId, call.name, call.args),
+        result: await this.workspace.executeTool(input.conversationId, call.name, enrichWorkspaceToolArgs(input, call)),
       };
     } catch (error) {
       return {
@@ -275,6 +308,20 @@ function normalizeAdapterError(error: AdapterErrorPayload, callerSignal?: AbortS
 }
 
 function surfaceAdapterError(input: AgentToolRunInput, error: AdapterErrorPayload): void {
+  input.send({
+    op: 'agent_activity',
+    activityId: `${input.msgId}:stream:${Date.now()}`,
+    conversationId: input.conversationId,
+    msgId: input.msgId,
+    agentId: requestAgentId(input.request),
+    agentName: requestAgentName(input.request),
+    kind: 'stream',
+    status: 'failed',
+    title: `Agent stream interrupted: ${error.code}`,
+    detail: error.message,
+    createdAt: new Date().toISOString(),
+  });
+
   if (input.suppressRetryableErrors && error.retryable) {
     input.send({
       op: 'msg_thinking',
@@ -294,6 +341,19 @@ function appendWorkspaceInstructions(systemPrompt: string | undefined, toolUse: 
     'You are not limited to answering with code snippets. When the user asks you to build, modify, debug, or verify a project, use the workspace tools to create/edit/delete files and run terminal commands. ' +
     'Prefer actually writing files and running checks over only explaining what should be done. ' +
     'All file paths are relative to this conversation workspace. Keep command output concise and continue until the task is in a verifiable state.\n\n' +
+    'Product and implementation rules:\n' +
+    '- Ask the user a concrete question when a missing decision would change the product shape, data/compliance boundary, deployment cost, or required credentials. Do not ask for permission to continue when a reasonable low-risk local path exists.\n' +
+    '- Do not ship placeholder-only UI or fake capability. Every visible control, chart, table, and KPI must have real local state/data flow/error state, or be explicitly disabled with a concrete next step.\n' +
+    '- For external APIs, databases, search, queues, object storage, or auth providers, create `.env.example` with exact variable names and implement a provider boundary. Local mock/demo data must be labeled and isolated behind that boundary.\n' +
+    '- If local infrastructure is needed, create or update `docker-compose.yml`, schema/migration/seed files, and run a non-long-running Docker diagnostic such as `docker compose config`. If Docker is unavailable, report the real CLI/daemon error and the exact setup step instead of skipping it.\n' +
+    '- Treat PROJECT.md and TEAM_MEMORY.md as shared team memory. Read them before substantial work and update TEAM_MEMORY.md when you change shared decisions, environment contracts, handoffs, or unresolved questions.\n\n' +
+    'Team coordination rules:\n' +
+    '- Use `task_board_list` before non-trivial work to inspect current owners, dependencies, blockers, handoffs, and artifact paths.\n' +
+    '- Use `task_board_update` when you start, block, finish, or hand off a task. Include concrete blockers, failed commands, credential names, or produced workspace paths so the next agent can continue without guessing.\n\n' +
+    '- Use `team_message_list` before starting implementation work; use `team_message_send` for directed teammate handoffs or API/data/env contract changes that a specific role must see.\n' +
+    '- Use `team_wake_list` to see directed messages that should wake or be claimed by your role; use `team_wake_update` after claiming or resolving one.\n' +
+    '- Use `memory_context` with a task-specific `query` before substantial work. Treat returned highlights as the first-pass memory index, then read full entries only when needed. Use `memory_note` only for durable facts: product decisions, shared contracts, role learnings, or local setup caveats.\n' +
+    '- Before your final response, run a memory review in your own reasoning: if this work changed product decisions, shared APIs/schemas, env variables, Docker/database services, deployment commands, role handoffs, or local setup caveats, call `memory_note` first. If nothing durable changed, do not write memory.\n\n' +
     'Tool efficiency rules:\n' +
     '- For project generation or multi-file edits, prefer `workspace_write_many` over repeated `workspace_write` calls.\n' +
     '- For inspecting several files, prefer `workspace_read_many` over repeated `workspace_read` calls.\n' +
@@ -340,6 +400,96 @@ function safeCompactJson(value: unknown): string {
   }
 }
 
+function requestAgentName(req: ChatRequest): string {
+  const raw = req.metadata?.agentName;
+  return typeof raw === 'string' && raw.trim() ? raw : 'Agent';
+}
+
+function requestAgentId(req: ChatRequest): string | undefined {
+  const raw = req.metadata?.agentId;
+  return typeof raw === 'string' && raw.trim() ? raw : undefined;
+}
+
+function enrichWorkspaceToolArgs(input: AgentToolRunInput, call: ToolCall): unknown {
+  if (!call.args || typeof call.args !== 'object') return call.args;
+  const args = { ...(call.args as Record<string, unknown>) };
+  const agentId = requestAgentId(input.request);
+  const agentName = requestAgentName(input.request);
+
+  if (call.name === 'team_message_send') {
+    if (!args.fromAgentId && agentId) args.fromAgentId = agentId;
+    if (!args.fromAgentName) args.fromAgentName = agentName;
+  }
+
+  if (call.name === 'team_message_list') {
+    if (!args.recipient) args.recipient = agentName || agentId;
+  }
+
+  if (call.name === 'team_wake_list') {
+    if (!args.target) args.target = agentName || agentId;
+  }
+
+  if (call.name === 'team_wake_update') {
+    if (!args.agentId && agentId) args.agentId = agentId;
+    if (!args.agentName) args.agentName = agentName;
+  }
+
+  if (call.name === 'memory_context' || call.name === 'memory_note') {
+    if (!args.agentId && agentId) args.agentId = agentId;
+    if (!args.agentName) args.agentName = agentName;
+  }
+
+  return args;
+}
+
+function sendAgentActivity(
+  input: AgentToolRunInput,
+  call: ToolCall,
+  event: {
+    status: 'running' | 'succeeded' | 'failed';
+    title: string;
+    detail?: string;
+  },
+): void {
+  input.send({
+    op: 'agent_activity',
+    activityId: `${input.msgId}:tool:${call.id}`,
+    conversationId: input.conversationId,
+    msgId: input.msgId,
+    agentId: requestAgentId(input.request),
+    agentName: requestAgentName(input.request),
+    kind: activityKindForTool(call.name),
+    toolName: call.name,
+    status: event.status,
+    title: event.title,
+    detail: event.detail,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+function sendAgentState(
+  input: AgentToolRunInput,
+  state: AgentRuntimeState,
+  reason?: string,
+): void {
+  input.send({
+    op: 'agent_state',
+    conversationId: input.conversationId,
+    agentId: requestAgentId(input.request),
+    agentName: requestAgentName(input.request),
+    msgId: input.msgId,
+    state,
+    reason,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+function activityKindForTool(name: string): 'workspace' | 'terminal' | 'file' | 'stream' {
+  if (name === 'terminal_run') return 'terminal';
+  if (name === 'file_patch') return 'file';
+  return 'workspace';
+}
+
 function argStr(args: unknown, key: string): string | undefined {
   if (!args || typeof args !== 'object') return undefined;
   const v = (args as Record<string, unknown>)[key];
@@ -367,6 +517,24 @@ function describeToolCall(name: string, args: unknown): string {
       return `浏览 ${argStr(args, 'path') ?? '工作区'}`;
     case 'workspace_delete':
       return `删除 ${argStr(args, 'path') ?? ''}`;
+    case 'task_board_list':
+      return 'Read team task board';
+    case 'task_board_update':
+      return `Update task board ${argStr(args, 'taskId') ?? ''}`;
+    case 'team_message_send':
+      return `Send teammate message to ${argStr(args, 'to') ?? 'teammate'}`;
+    case 'team_message_list':
+      return 'Read teammate mailbox';
+    case 'team_message_mark_read':
+      return 'Mark teammate messages read';
+    case 'team_wake_list':
+      return 'Read teammate wake queue';
+    case 'team_wake_update':
+      return `Update wake request ${argStr(args, 'wakeId') ?? ''}`;
+    case 'memory_context':
+      return 'Read layered memory';
+    case 'memory_note':
+      return 'Write memory note';
     case 'terminal_run':
       return `运行 \`${(argStr(args, 'command') ?? '').slice(0, 120)}\``;
     default:
@@ -374,10 +542,67 @@ function describeToolCall(name: string, args: unknown): string {
   }
 }
 
+function describeToolArgs(name: string, args: unknown): string {
+  switch (name) {
+    case 'workspace_write':
+    case 'workspace_read':
+    case 'workspace_delete':
+      return argStr(args, 'path') ?? '';
+    case 'workspace_write_many':
+    case 'workspace_read_many': {
+      const files = (args as { files?: Array<{ path?: unknown }> })?.files;
+      if (!Array.isArray(files)) return '';
+      return files
+        .slice(0, 8)
+        .map((file) => (typeof file.path === 'string' ? file.path : null))
+        .filter(Boolean)
+        .join('\n');
+    }
+    case 'workspace_list':
+      return argStr(args, 'path') || 'workspace root';
+    case 'task_board_update':
+      return [argStr(args, 'taskId'), argStr(args, 'status'), argStr(args, 'blocker'), argStr(args, 'handoff')]
+        .filter(Boolean)
+        .join('\n');
+    case 'task_board_list':
+      return '.agenthub/TASK_BOARD.json';
+    case 'team_message_send':
+      return [argStr(args, 'to'), argStr(args, 'subject')].filter(Boolean).join('\n');
+    case 'team_message_list':
+      return argStr(args, 'recipient') || 'current agent';
+    case 'team_message_mark_read':
+      return safeCompactJson(args);
+    case 'team_wake_list':
+      return argStr(args, 'target') || 'current agent';
+    case 'team_wake_update':
+      return [argStr(args, 'wakeId'), argStr(args, 'status')].filter(Boolean).join('\n');
+    case 'memory_context':
+      return argStr(args, 'query') || 'PROJECT.md\nTEAM_MEMORY.md\n.agenthub/memory';
+    case 'memory_note':
+      return [argStr(args, 'scope'), argStr(args, 'title'), argStr(args, 'note')].filter(Boolean).join('\n');
+    case 'terminal_run':
+      return argStr(args, 'command') ?? '';
+    default:
+      return safeCompactJson(args);
+  }
+}
+
 /** Human "outcome" line after a tool finished. */
 function describeToolDone(name: string, args: unknown, result: unknown): string {
   const r = result as { ok?: boolean; error?: string; result?: unknown } | undefined;
   if (r && r.ok === false) return `✗ 失败：${String(r.error ?? '').slice(0, 200)}`;
+
+  if (
+    name === 'team_message_send' ||
+    name === 'team_message_list' ||
+    name === 'team_message_mark_read' ||
+    name === 'team_wake_list' ||
+    name === 'team_wake_update' ||
+    name === 'memory_context' ||
+    name === 'memory_note'
+  ) {
+    return 'Done';
+  }
 
   if (name === 'terminal_run') {
     const inner = (r?.result ?? {}) as { exitCode?: number | null; timedOut?: boolean };
